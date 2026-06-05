@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CNC 主轴健康监测系统</title>
+    <link rel="stylesheet" href="src/style.css">
+</head>
+<body>
+    <div id="app">
+        <div id="top-bar">
+            <div class="top-bar-left">
+                <svg class="cnc-icon" viewBox="0 0 24 24">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"/>
+                    <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                </svg>
+                <span class="system-title">CNC 主轴健康监测系统</span>
+                <span class="system-subtitle">Spindle Health Monitor v2.0</span>
+            </div>
+            <div class="top-bar-center">
+                <div class="status-indicator">
+                    <span class="status-dot" id="ws-status-dot"></span>
+                    <span id="ws-status-text">已连接</span>
+                </div>
+                <div class="separator"></div>
+                <div class="status-indicator">
+                    <span>在线机床:</span>
+                    <span id="online-count" style="color: var(--success); font-family: var(--font-mono); font-weight: 600;">0</span>
+                </div>
+            </div>
+            <div class="top-bar-right">
+                <span class="current-time" id="current-time">--:--:--</span>
+                <div class="separator"></div>
+                <div class="alert-badge normal" id="alert-badge">
+                    <span>⚠</span>
+                    <span id="alert-count">0</span>
+                    <span>告警</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="sidebar">
+            <div class="sidebar-header">
+                <span>机床列表</span>
+                <span class="machine-count" id="machine-count">0 台</span>
+            </div>
+            <div class="machine-list" id="machine-list"></div>
+        </div>
+
+        <div id="main-area">
+            <div class="main-top">
+                <canvas id="spindle-canvas"></canvas>
+            </div>
+            <div class="main-bottom">
+                <canvas id="spectrum-canvas"></canvas>
+            </div>
+        </div>
+
+        <div id="right-panel">
+            <div class="right-panel-header">
+                <span class="right-panel-title">传感器详情</span>
+                <button class="close-panel-btn" id="close-panel-btn">✕</button>
+            </div>
+            <div id="sensor-panel-content">
+                <div class="no-sensor-selected">
+                    <div class="no-sensor-icon">◉</div>
+                    <div class="no-sensor-text">点击主轴图上的传感器节点<br>查看详细监测数据</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="bottom-bar">
+            <div class="bottom-chart-container">
+                <div class="bottom-chart-title">机床健康排名</div>
+                <div class="bottom-chart-body">
+                    <canvas id="ranking-canvas"></canvas>
+                </div>
+            </div>
+            <div class="bottom-chart-container">
+                <div class="bottom-chart-title">月度故障统计</div>
+                <div class="bottom-chart-body">
+                    <canvas id="fault-pie-canvas"></canvas>
+                </div>
+            </div>
+            <div class="bottom-chart-container">
+                <div class="bottom-chart-title">告警时间线</div>
+                <div class="bottom-chart-body">
+                    <canvas id="alert-timeline-canvas"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast-container" id="toast-container"></div>
+    <div class="tooltip" id="tooltip" style="display:none;"></div>
+
+    <script src="src/spindle_diagram.js"></script>
+    <script src="src/spectrum_chart.js"></script>
+    <script src="src/sensor_panel.js"></script>
+    <script src="src/ranking.js"></script>
+    <script src="src/app.js"></script>
+</body>
+</html>
