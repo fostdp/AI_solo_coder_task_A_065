@@ -3,101 +3,195 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CNC 主轴健康监测系统</title>
-    <link rel="stylesheet" href="src/style.css">
+    <title>精密数控机床主轴健康监控与剩余寿命预测系统</title>
+    <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-    <div id="app">
-        <div id="top-bar">
-            <div class="top-bar-left">
-                <svg class="cnc-icon" viewBox="0 0 24 24">
-                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"/>
-                    <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/>
-                </svg>
-                <span class="system-title">CNC 主轴健康监测系统</span>
-                <span class="system-subtitle">Spindle Health Monitor v2.0</span>
+    <div class="app-container">
+        <header class="app-header">
+            <div class="header-left">
+                <h1>🔧 精密数控机床主轴健康监控系统</h1>
+                <span class="subtitle">Spindle Health Monitoring & RUL Prediction System</span>
             </div>
-            <div class="top-bar-center">
-                <div class="status-indicator">
-                    <span class="status-dot" id="ws-status-dot"></span>
-                    <span id="ws-status-text">已连接</span>
+            <div class="header-right">
+                <div class="system-status">
+                    <span class="status-indicator online"></span>
+                    <span>系统运行中</span>
                 </div>
-                <div class="separator"></div>
-                <div class="status-indicator">
-                    <span>在线机床:</span>
-                    <span id="online-count" style="color: var(--success); font-family: var(--font-mono); font-weight: 600;">0</span>
-                </div>
+                <div class="current-time" id="currentTime"></div>
             </div>
-            <div class="top-bar-right">
-                <span class="current-time" id="current-time">--:--:--</span>
-                <div class="separator"></div>
-                <div class="alert-badge normal" id="alert-badge">
-                    <span>⚠</span>
-                    <span id="alert-count">0</span>
-                    <span>告警</span>
-                </div>
-            </div>
-        </div>
+        </header>
 
-        <div id="sidebar">
-            <div class="sidebar-header">
-                <span>机床列表</span>
-                <span class="machine-count" id="machine-count">0 台</span>
-            </div>
-            <div class="machine-list" id="machine-list"></div>
-        </div>
-
-        <div id="main-area">
-            <div class="main-top">
-                <canvas id="spindle-canvas"></canvas>
-            </div>
-            <div class="main-bottom">
-                <canvas id="spectrum-canvas"></canvas>
-            </div>
-        </div>
-
-        <div id="right-panel">
-            <div class="right-panel-header">
-                <span class="right-panel-title">传感器详情</span>
-                <button class="close-panel-btn" id="close-panel-btn">✕</button>
-            </div>
-            <div id="sensor-panel-content">
-                <div class="no-sensor-selected">
-                    <div class="no-sensor-icon">◉</div>
-                    <div class="no-sensor-text">点击主轴图上的传感器节点<br>查看详细监测数据</div>
+        <div class="main-content">
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <h3>机床列表</h3>
+                    <div class="machine-list" id="machineList">
+                    </div>
                 </div>
-            </div>
-        </div>
+                <div class="sidebar-section">
+                    <h3>实时告警</h3>
+                    <div class="alarm-list" id="alarmList">
+                    </div>
+                </div>
+            </aside>
 
-        <div id="bottom-bar">
-            <div class="bottom-chart-container">
-                <div class="bottom-chart-title">机床健康排名</div>
-                <div class="bottom-chart-body">
-                    <canvas id="ranking-canvas"></canvas>
+            <main class="content-area">
+                <div class="dashboard-grid">
+                    <div class="panel large-panel">
+                        <div class="panel-header">
+                            <h2>主轴剖面图 & 传感器实时状态</h2>
+                            <div class="legend">
+                                <span class="legend-item"><span class="legend-dot green"></span> 正常 &lt;2.8mm/s</span>
+                                <span class="legend-item"><span class="legend-dot yellow"></span> 预警 2.8-7.1mm/s</span>
+                                <span class="legend-item"><span class="legend-dot red"></span> 危险 &gt;7.1mm/s</span>
+                            </div>
+                        </div>
+                        <div class="panel-body">
+                            <canvas id="spindleCanvas" width="800" height="400"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h2>健康评分</h2>
+                        </div>
+                        <div class="panel-body">
+                            <div class="health-score-display">
+                                <div class="score-circle" id="healthScore">
+                                    <span class="score-value">--</span>
+                                    <span class="score-label">综合评分</span>
+                                </div>
+                                <div class="score-details">
+                                    <div class="score-item">
+                                        <span class="score-name">振动</span>
+                                        <div class="score-bar"><div class="score-fill green" id="vibrationScore" style="width: 0%"></div></div>
+                                        <span class="score-num" id="vibrationScoreNum">--</span>
+                                    </div>
+                                    <div class="score-item">
+                                        <span class="score-name">温度</span>
+                                        <div class="score-bar"><div class="score-fill blue" id="temperatureScore" style="width: 0%"></div></div>
+                                        <span class="score-num" id="temperatureScoreNum">--</span>
+                                    </div>
+                                    <div class="score-item">
+                                        <span class="score-name">位移</span>
+                                        <div class="score-bar"><div class="score-fill purple" id="displacementScore" style="width: 0%"></div></div>
+                                        <span class="score-num" id="displacementScoreNum">--</span>
+                                    </div>
+                                    <div class="score-item">
+                                        <span class="score-name">RUL</span>
+                                        <div class="score-bar"><div class="score-fill orange" id="rulScore" style="width: 0%"></div></div>
+                                        <span class="score-num" id="rulScoreNum">--</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h2>剩余寿命预测 (RUL)</h2>
+                        </div>
+                        <div class="panel-body">
+                            <div class="rul-display">
+                                <div class="rul-hours" id="rulHours">--</div>
+                                <div class="rul-label">剩余寿命 (小时)</div>
+                                <div class="rul-confidence">
+                                    <span>置信度: </span>
+                                    <span id="rulConfidence">--%</span>
+                                </div>
+                                <div class="rul-details">
+                                    <div class="rul-detail-item">
+                                        <span>SKF L10寿命:</span>
+                                        <span id="skfLife">-- h</span>
+                                    </div>
+                                    <div class="rul-detail-item">
+                                        <span>LSTM预测:</span>
+                                        <span id="lstmPred">-- h</span>
+                                    </div>
+                                    <div class="rul-detail-item">
+                                        <span>振动趋势:</span>
+                                        <span id="vibTrend">--%</span>
+                                    </div>
+                                    <div class="rul-detail-item">
+                                        <span>温度变化率:</span>
+                                        <span id="tempRate">--%</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="panel large-panel">
+                        <div class="panel-header">
+                            <h2>振动频谱瀑布图</h2>
+                            <select id="spectrumSensorSelect">
+                                <option value="1">前轴承径向X</option>
+                                <option value="2">前轴承径向Y</option>
+                                <option value="3">前轴承轴向</option>
+                                <option value="4">后轴承径向X</option>
+                            </select>
+                        </div>
+                        <div class="panel-body">
+                            <canvas id="spectrumCanvas" width="800" height="300"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h2>健康评分排行榜</h2>
+                        </div>
+                        <div class="panel-body">
+                            <div class="ranking-list" id="rankingList">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h2>本月故障统计</h2>
+                        </div>
+                        <div class="panel-body">
+                            <div class="stats-grid" id="statsGrid">
+                            </div>
+                        </div>
+                    </div>
                 </div>
+            </main>
+        </div>
+    </div>
+
+    <div class="modal" id="sensorModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modalTitle">传感器详情</h2>
+                <button class="close-btn" onclick="closeSensorModal()">&times;</button>
             </div>
-            <div class="bottom-chart-container">
-                <div class="bottom-chart-title">月度故障统计</div>
-                <div class="bottom-chart-body">
-                    <canvas id="fault-pie-canvas"></canvas>
+            <div class="modal-body">
+                <div class="sensor-info" id="sensorInfo">
                 </div>
-            </div>
-            <div class="bottom-chart-container">
-                <div class="bottom-chart-title">告警时间线</div>
-                <div class="bottom-chart-body">
-                    <canvas id="alert-timeline-canvas"></canvas>
+                <div class="charts-container">
+                    <div class="chart-panel">
+                        <h3>近1小时时域波形</h3>
+                        <canvas id="timeDomainCanvas" width="400" height="200"></canvas>
+                    </div>
+                    <div class="chart-panel">
+                        <h3>频谱图</h3>
+                        <canvas id="freqDomainCanvas" width="400" height="200"></canvas>
+                    </div>
+                </div>
+                <div class="history-panel">
+                    <h3>历史趋势 (近7天)</h3>
+                    <canvas id="historyCanvas" width="820" height="200"></canvas>
                 </div>
             </div>
         </div>
     </div>
 
-    <div class="toast-container" id="toast-container"></div>
-    <div class="tooltip" id="tooltip" style="display:none;"></div>
-
-    <script src="src/spindle_diagram.js"></script>
-    <script src="src/spectrum_chart.js"></script>
-    <script src="src/sensor_panel.js"></script>
-    <script src="src/ranking.js"></script>
-    <script src="src/app.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/spindle.js"></script>
+    <script src="js/spectrum.js"></script>
+    <script src="js/sensor_detail.js"></script>
+    <script src="js/main.js"></script>
 </body>
 </html>
