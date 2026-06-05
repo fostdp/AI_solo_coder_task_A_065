@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "net"] }
 actix-web = "4"
 actix-cors = "0.7"
 clickhouse = "0.13"

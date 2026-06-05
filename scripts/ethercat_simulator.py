@@ -340,30 +340,45 @@ class BinaryProtocol:
 
 
 class UDPSender:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, base_port: int, port_count: int = 4):
         self.host = host
-        self.port = port
-        self._transport = None
+        self.base_port = base_port
+        self.port_count = port_count
+        self._transports: dict = {}
         self._loop = None
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._transport, _ = await self._loop.create_datagram_endpoint(
-            asyncio.DatagramProtocol,
-            remote_addr=(self.host, self.port),
-        )
+        for i in range(self.port_count):
+            port = self.base_port + i
+            transport, _ = await self._loop.create_datagram_endpoint(
+                asyncio.DatagramProtocol,
+                remote_addr=(self.host, port),
+            )
+            self._transports[port] = transport
 
-    async def send_json(self, data: dict) -> None:
+    def _get_transport(self, machine_id: int):
+        shard = (machine_id - 1) % self.port_count
+        port = self.base_port + shard
+        return self._transports.get(port)
+
+    async def send_json(self, data: dict, machine_id: int = 0) -> None:
         payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
-        self._transport.sendto(payload)
+        mid = data.get("machine_id", machine_id)
+        transport = self._get_transport(mid)
+        if transport:
+            transport.sendto(payload)
 
     async def send_binary(self, readings: List[SensorReading]) -> None:
         payload = BinaryProtocol.pack_machine_data(readings)
-        self._transport.sendto(payload)
+        mid = readings[0].machine_id if readings else 0
+        transport = self._get_transport(mid)
+        if transport:
+            transport.sendto(payload)
 
     async def close(self) -> None:
-        if self._transport:
-            self._transport.close()
+        for transport in self._transports.values():
+            transport.close()
 
 
 class Simulator:
@@ -424,10 +439,10 @@ class Simulator:
 
     async def run(self) -> None:
         self._create_machines()
-        self.sender = UDPSender(self.target_host, self.target_port)
+        self.sender = UDPSender(self.target_host, self.target_port, port_count=4)
         await self.sender.start()
 
-        print(f"EtherCAT Simulator started: {self.num_machines} machines -> {self.target_host}:{self.target_port}")
+        print(f"EtherCAT Simulator started: {self.num_machines} machines -> {self.target_host}:{self.target_port}-{self.target_port+3}")
         print(f"Protocol: {'binary' if self.send_binary else 'JSON'}")
         print(f"Degradation rate: {self.degradation_rate}")
 

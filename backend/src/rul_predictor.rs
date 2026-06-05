@@ -23,7 +23,7 @@ use std::fs;
 
 const SKF_C_KN: f64 = 69.5;
 const BEARING_EXPONENT: f64 = 3.0;
-const INPUT_SIZE: usize = 6;
+const INPUT_SIZE: usize = 8;
 const HIDDEN_SIZE: usize = 64;
 const NUM_LAYERS: usize = 2;
 const SEQ_LEN: usize = 48;
@@ -37,6 +37,9 @@ const NORMAL_TEMP: f64 = 40.0;
 const MAX_TEMP: f64 = 80.0;
 const MAX_VIB: f64 = 12.0;
 const MAX_DISP: f64 = 50.0;
+const RPM_MIN: f64 = 0.0;
+const RPM_MAX: f64 = 24000.0;
+const RUL_SMOOTH_ALPHA: f64 = 0.3;
 
 // ─── Severity ────────────────────────────────────────────────────────────────
 
@@ -59,6 +62,109 @@ impl std::fmt::Display for Severity {
             Self::Red => write!(f, "Red"),
         }
     }
+}
+
+// ─── Operating Condition Classification ───────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperatingCondition {
+    Idle,
+    LowSpeed,
+    MediumSpeed,
+    HighSpeed,
+    Overload,
+}
+
+impl std::fmt::Display for OperatingCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => write!(f, "Idle"),
+            Self::LowSpeed => write!(f, "LowSpeed"),
+            Self::MediumSpeed => write!(f, "MediumSpeed"),
+            Self::HighSpeed => write!(f, "HighSpeed"),
+            Self::Overload => write!(f, "Overload"),
+        }
+    }
+}
+
+pub fn classify_operating_condition(rpm: f64, vibration_rms: f64) -> OperatingCondition {
+    if rpm < 500.0 {
+        OperatingCondition::Idle
+    } else if vibration_rms > 10.0 {
+        OperatingCondition::Overload
+    } else if rpm < 8000.0 {
+        OperatingCondition::LowSpeed
+    } else if rpm < 16000.0 {
+        OperatingCondition::MediumSpeed
+    } else {
+        OperatingCondition::HighSpeed
+    }
+}
+
+// ─── Condition-specific Normalization ─────────────────────────────────────────
+
+struct ConditionNormParams {
+    vib_mean: f64,
+    vib_std: f64,
+    temp_mean: f64,
+    temp_std: f64,
+    disp_mean: f64,
+    disp_std: f64,
+    rpm_mean: f64,
+    rpm_std: f64,
+}
+
+const NORM_PARAMS: &[ConditionNormParams; 5] = &[
+    ConditionNormParams { vib_mean: 0.5, vib_std: 0.3, temp_mean: 35.0, temp_std: 2.0, disp_mean: 1.0, disp_std: 0.5, rpm_mean: 0.0, rpm_std: 100.0 },
+    ConditionNormParams { vib_mean: 1.2, vib_std: 0.5, temp_mean: 38.0, temp_std: 2.5, disp_mean: 1.5, disp_std: 0.8, rpm_mean: 5000.0, rpm_std: 1500.0 },
+    ConditionNormParams { vib_mean: 2.0, vib_std: 0.8, temp_mean: 40.0, temp_std: 3.0, disp_mean: 2.0, disp_std: 1.0, rpm_mean: 12000.0, rpm_std: 3000.0 },
+    ConditionNormParams { vib_mean: 3.0, vib_std: 1.2, temp_mean: 43.0, temp_std: 3.5, disp_mean: 3.0, disp_std: 1.5, rpm_mean: 20000.0, rpm_std: 2500.0 },
+    ConditionNormParams { vib_mean: 8.0, vib_std: 2.0, temp_mean: 50.0, temp_std: 5.0, disp_mean: 8.0, disp_std: 3.0, rpm_mean: 22000.0, rpm_std: 2000.0 },
+];
+
+fn get_norm_params(condition: OperatingCondition) -> &'static ConditionNormParams {
+    match condition {
+        OperatingCondition::Idle => &NORM_PARAMS[0],
+        OperatingCondition::LowSpeed => &NORM_PARAMS[1],
+        OperatingCondition::MediumSpeed => &NORM_PARAMS[2],
+        OperatingCondition::HighSpeed => &NORM_PARAMS[3],
+        OperatingCondition::Overload => &NORM_PARAMS[4],
+    }
+}
+
+pub fn normalize_features(
+    vibration_rms: f64,
+    temperature: f64,
+    temperature_rate: f64,
+    displacement: f64,
+    rpm: f64,
+    health_score: f64,
+    condition: OperatingCondition,
+) -> Array1<f64> {
+    let p = get_norm_params(condition);
+    let vib_norm = (vibration_rms - p.vib_mean) / p.vib_std.max(0.01);
+    let temp_norm = (temperature - p.temp_mean) / p.temp_std.max(0.01);
+    let temp_rate_norm = temperature_rate / 1.0;
+    let disp_norm = (displacement - p.disp_mean) / p.disp_std.max(0.01);
+    let rpm_norm = (rpm - p.rpm_mean) / p.rpm_std.max(0.01);
+    let load_factor = vibration_rms / VIB_YELLOW;
+    let condition_code = match condition {
+        OperatingCondition::Idle => 0.0,
+        OperatingCondition::LowSpeed => 0.25,
+        OperatingCondition::MediumSpeed => 0.5,
+        OperatingCondition::HighSpeed => 0.75,
+        OperatingCondition::Overload => 1.0,
+    };
+    Array1::from_vec(vec![
+        vib_norm,
+        temp_norm,
+        temp_rate_norm,
+        disp_norm,
+        rpm_norm,
+        load_factor,
+        condition_code,
+        health_score / 100.0,
+    ])
 }
 
 // ─── Health Score ────────────────────────────────────────────────────────────
@@ -424,6 +530,8 @@ pub struct MaintenanceOrder {
 pub struct RULPredictor {
     pub lstm_weights: LSTMWeights,
     pub clickhouse_url: String,
+    rul_cache: std::cell::RefCell<HashMap<u16, f64>>,
+    condition_cache: std::cell::RefCell<HashMap<u16, OperatingCondition>>,
 }
 
 impl RULPredictor {
@@ -432,15 +540,18 @@ impl RULPredictor {
         Self {
             lstm_weights: LSTMWeights::generate_demo(),
             clickhouse_url: clickhouse_url.to_string(),
+            rul_cache: std::cell::RefCell::new(HashMap::new()),
+            condition_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
-    /// Create a predictor that loads pre-trained LSTM weights from a JSON file.
     pub fn with_weights(clickhouse_url: &str, weights_path: &str) -> Result<Self> {
         let lstm_weights = LSTMWeights::load_from_json(weights_path)?;
         Ok(Self {
             lstm_weights,
             clickhouse_url: clickhouse_url.to_string(),
+            rul_cache: std::cell::RefCell::new(HashMap::new()),
+            condition_cache: std::cell::RefCell::new(HashMap::new()),
         })
     }
 
@@ -466,6 +577,8 @@ impl RULPredictor {
         vibration_history: &[f64],
         feature_window: &[Array1<f64>],
     ) -> RULResult {
+        let current_condition = classify_operating_condition(rpm, vibration_rms);
+
         let skf_rul = calculate_skf_rul(
             rpm,
             vibration_rms,
@@ -474,13 +587,59 @@ impl RULPredictor {
             contamination_level,
         );
 
-        let lstm_rul = if feature_window.len() >= SEQ_LEN {
-            lstm_forward(&self.lstm_weights, feature_window)
+        let normalized_window: Vec<Array1<f64>> = if feature_window.len() >= SEQ_LEN {
+            feature_window.iter().map(|f| {
+                let vr = f.get(0).copied().unwrap_or(0.0);
+                let t = f.get(1).copied().unwrap_or(40.0);
+                let tr = f.get(2).copied().unwrap_or(0.0);
+                let d = f.get(3).copied().unwrap_or(0.0);
+                let r = f.get(4).copied().unwrap_or(rpm);
+                let hs = f.get(5).copied().unwrap_or(80.0);
+                normalize_features(vr, t, tr, d, r, hs, current_condition)
+            }).collect()
+        } else {
+            let health_score = calculate_health_score(vibration_rms, temperature, displacement).score;
+            let normalized = normalize_features(
+                vibration_rms, temperature, 0.05, displacement, rpm,
+                health_score as f64, current_condition,
+            );
+            vec![normalized; SEQ_LEN]
+        };
+
+        let lstm_rul = if normalized_window.len() >= SEQ_LEN {
+            lstm_forward(&self.lstm_weights, &normalized_window)
         } else {
             skf_rul
         };
 
-        let rul_hours = SKF_WEIGHT * skf_rul + LSTM_WEIGHT * lstm_rul;
+        let condition_baseline = match current_condition {
+            OperatingCondition::Idle => 8000.0,
+            OperatingCondition::LowSpeed => 5000.0,
+            OperatingCondition::MediumSpeed => 3000.0,
+            OperatingCondition::HighSpeed => 1500.0,
+            OperatingCondition::Overload => 500.0,
+        };
+
+        let condition_weight = match current_condition {
+            OperatingCondition::Idle => 0.0,
+            OperatingCondition::LowSpeed => 0.1,
+            OperatingCondition::MediumSpeed => 0.15,
+            OperatingCondition::HighSpeed => 0.2,
+            OperatingCondition::Overload => 0.3,
+        };
+        let raw_rul = (1.0 - condition_weight) * (SKF_WEIGHT * skf_rul + LSTM_WEIGHT * lstm_rul)
+            + condition_weight * condition_baseline.min(skf_rul + lstm_rul) * 0.5;
+
+        let smoothed_rul = {
+            let cache = self.rul_cache.borrow();
+            if let Some(&prev_rul) = cache.get(&0u16) {
+                RUL_SMOOTH_ALPHA * raw_rul + (1.0 - RUL_SMOOTH_ALPHA) * prev_rul
+            } else {
+                raw_rul
+            }
+        };
+        self.rul_cache.borrow_mut().insert(0u16, smoothed_rul);
+        self.condition_cache.borrow_mut().insert(0u16, current_condition);
 
         let (slope, _) = detect_degradation_trend(vibration_history);
         let degradation_rate = slope.max(0.0);
@@ -488,13 +647,108 @@ impl RULPredictor {
         let data_factor = (feature_window.len() as f64 / SEQ_LEN as f64).min(1.0);
         let agreement = 1.0
             - ((skf_rul - lstm_rul).abs() / skf_rul.max(lstm_rul).max(1.0)).min(1.0);
-        let confidence = data_factor * 0.5 + agreement * 0.5;
+        let condition_stability = {
+            let cond_cache = self.condition_cache.borrow();
+            if cond_cache.len() > 1 { 0.9 } else { 0.7 }
+        };
+        let confidence = (data_factor * 0.4 + agreement * 0.3 + condition_stability * 0.3).clamp(0.0, 1.0);
 
         RULResult {
-            rul_hours: rul_hours.max(0.0),
+            rul_hours: smoothed_rul.max(0.0),
             skf_rul: skf_rul.max(0.0),
             lstm_rul: lstm_rul.max(0.0),
-            confidence: confidence.clamp(0.0, 1.0),
+            confidence,
+            degradation_rate,
+        }
+    }
+
+    pub fn predict_rul_for_machine(
+        &self,
+        machine_id: u16,
+        rpm: f64,
+        vibration_rms: f64,
+        temperature: f64,
+        displacement: f64,
+        baseline_load_kn: f64,
+        contamination_level: f64,
+        vibration_history: &[f64],
+        feature_window: &[Array1<f64>],
+    ) -> RULResult {
+        let current_condition = classify_operating_condition(rpm, vibration_rms);
+
+        let skf_rul = calculate_skf_rul(
+            rpm, vibration_rms, temperature,
+            baseline_load_kn, contamination_level,
+        );
+
+        let health_score = calculate_health_score(vibration_rms, temperature, displacement).score;
+        let normalized = normalize_features(
+            vibration_rms, temperature, 0.05, displacement, rpm,
+            health_score as f64, current_condition,
+        );
+
+        let normalized_window: Vec<Array1<f64>> = if feature_window.len() >= SEQ_LEN {
+            feature_window.iter().map(|f| {
+                let vr = f.get(0).copied().unwrap_or(0.0);
+                let t = f.get(1).copied().unwrap_or(40.0);
+                let tr = f.get(2).copied().unwrap_or(0.0);
+                let d = f.get(3).copied().unwrap_or(0.0);
+                let r = f.get(4).copied().unwrap_or(rpm);
+                let hs = f.get(5).copied().unwrap_or(80.0);
+                normalize_features(vr, t, tr, d, r, hs, current_condition)
+            }).collect()
+        } else {
+            vec![normalized; SEQ_LEN]
+        };
+
+        let lstm_rul = if normalized_window.len() >= SEQ_LEN {
+            lstm_forward(&self.lstm_weights, &normalized_window)
+        } else {
+            skf_rul
+        };
+
+        let condition_baseline = match current_condition {
+            OperatingCondition::Idle => 8000.0,
+            OperatingCondition::LowSpeed => 5000.0,
+            OperatingCondition::MediumSpeed => 3000.0,
+            OperatingCondition::HighSpeed => 1500.0,
+            OperatingCondition::Overload => 500.0,
+        };
+
+        let condition_weight = match current_condition {
+            OperatingCondition::Idle => 0.0,
+            OperatingCondition::LowSpeed => 0.1,
+            OperatingCondition::MediumSpeed => 0.15,
+            OperatingCondition::HighSpeed => 0.2,
+            OperatingCondition::Overload => 0.3,
+        };
+        let raw_rul = (1.0 - condition_weight) * (SKF_WEIGHT * skf_rul + LSTM_WEIGHT * lstm_rul)
+            + condition_weight * condition_baseline.min(skf_rul + lstm_rul) * 0.5;
+
+        let smoothed_rul = {
+            let cache = self.rul_cache.borrow();
+            if let Some(&prev_rul) = cache.get(&machine_id) {
+                RUL_SMOOTH_ALPHA * raw_rul + (1.0 - RUL_SMOOTH_ALPHA) * prev_rul
+            } else {
+                raw_rul
+            }
+        };
+        self.rul_cache.borrow_mut().insert(machine_id, smoothed_rul);
+        self.condition_cache.borrow_mut().insert(machine_id, current_condition);
+
+        let (slope, _) = detect_degradation_trend(vibration_history);
+        let degradation_rate = slope.max(0.0);
+
+        let data_factor = (feature_window.len() as f64 / SEQ_LEN as f64).min(1.0);
+        let agreement = 1.0
+            - ((skf_rul - lstm_rul).abs() / skf_rul.max(lstm_rul).max(1.0)).min(1.0);
+        let confidence = (data_factor * 0.5 + agreement * 0.5).clamp(0.0, 1.0);
+
+        RULResult {
+            rul_hours: smoothed_rul.max(0.0),
+            skf_rul: skf_rul.max(0.0),
+            lstm_rul: lstm_rul.max(0.0),
+            confidence,
             degradation_rate,
         }
     }
@@ -609,7 +863,7 @@ mod tests {
     fn test_lstm_forward() {
         let weights = LSTMWeights::generate_demo();
         let input: Vec<Array1<f64>> = (0..SEQ_LEN)
-            .map(|_| Array1::from_vec(vec![2.5, 45.0, 0.1, 10.0, 3000.0, 75.0]))
+            .map(|_| Array1::from_vec(vec![2.5, 45.0, 0.1, 10.0, 3000.0, 0.35, 0.5, 0.75]))
             .collect();
         let output = lstm_forward(&weights, &input);
         assert!(output >= 0.0, "softplus output must be non-negative");
@@ -620,7 +874,7 @@ mod tests {
         let predictor = RULPredictor::new("http://localhost:8123");
         let history: Vec<f64> = (0..48).map(|i| 1.0 + i as f64 * 0.1).collect();
         let features: Vec<Array1<f64>> = (0..SEQ_LEN)
-            .map(|i| Array1::from_vec(vec![history[i], 45.0, 0.05, 10.0, 3000.0, 80.0]))
+            .map(|i| Array1::from_vec(vec![history[i], 45.0, 0.05, 10.0, 3000.0, 0.35, 0.5, 80.0]))
             .collect();
         let result = predictor.predict_rul(
             3000.0, 5.0, 45.0, 10.0, 5.0, 0.1, &history, &features,

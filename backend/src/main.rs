@@ -6,18 +6,19 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc, TimeZone};
 use clickhouse::{Client as ChClient, Row};
 use ndarray::Array1;
-use rul_predictor::{RULPredictor, RULResult, Severity, calculate_health_score, classify_vibration_severity};
+use rul_predictor::{RULPredictor, RULResult, Severity, calculate_health_score, classify_vibration_severity, classify_operating_condition, normalize_features, OperatingCondition};
 use rumqttc::{MqttOptions, Client as MqttClient, Event, Incoming, QoS};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock, Mutex};
 use tracing::{info, warn, error, debug};
 use uuid::Uuid;
 
 const UDP_PORT: u16 = 9001;
+const UDP_PORT_COUNT: u16 = 4;
 const HTTP_PORT: u16 = 8080;
 const CLICKHOUSE_URL: &str = "http://localhost:8123";
 const CLICKHOUSE_DB: &str = "spindle_monitor";
@@ -28,6 +29,7 @@ const VIB_ALERT_THRESHOLD: f64 = 7.1;
 const VIB_ALERT_DURATION_SECS: u64 = 10;
 const RUL_URGENT_THRESHOLD: f64 = 200.0;
 const RUL_MAINT_THRESHOLD: f64 = 500.0;
+const UDP_RECV_BUF_SIZE: usize = 65536;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 struct SensorDataClickhouse {
@@ -228,35 +230,100 @@ fn parse_json_frame(data: &[u8]) -> Option<BinaryFrame> {
     })
 }
 
-async fn udp_receiver(tx: mpsc::Sender<SensorReading>) -> Result<()> {
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", UDP_PORT))?;
-    socket.set_nonblocking(true)?;
-    let mut buf = [0u8; 65535];
-    info!("UDP receiver listening on port {}", UDP_PORT);
+async fn udp_receiver_single(
+    port: u16,
+    dispatchers: Arc<HashMap<u16, mpsc::Sender<SensorReading>>>,
+    fallback_tx: mpsc::Sender<SensorReading>,
+) -> Result<()> {
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).await?;
+    socket.set_recv_buffer_size(8 * 1024 * 1024)?;
+    let mut buf = vec![0u8; UDP_RECV_BUF_SIZE];
+    info!("Async UDP receiver listening on port {} (recvbuf=8MB)", port);
 
     loop {
-        match socket.recv_from(&mut buf) {
-            Ok((len, _addr)) => {
+        match socket.recv_from(&mut buf).await {
+            Ok((len, addr)) => {
                 let data = &buf[..len];
                 if let Some(frame) = parse_binary_frame(data)
                     .or_else(|| parse_json_frame(data))
                 {
                     for reading in frame.readings {
-                        if tx.send(reading).await.is_err() {
-                            break;
+                        let mid = reading.machine_id;
+                        if let Some(tx) = dispatchers.get(&mid) {
+                            let _ = tx.send(reading).await;
+                        } else {
+                            let _ = fallback_tx.send(reading).await;
                         }
                     }
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
             Err(e) => {
-                error!("UDP recv error: {}", e);
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                error!("UDP recv_from error on port {}: {}", port, e);
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
     }
+}
+
+async fn machine_dispatch_task(
+    machine_id: u16,
+    mut rx: mpsc::Receiver<SensorReading>,
+    ch_tx: mpsc::Sender<SensorReading>,
+    health_tx: mpsc::Sender<SensorReading>,
+    buffer_tx: mpsc::Sender<SensorReading>,
+) {
+    debug!("Dispatch task started for machine {}", machine_id);
+    while let Some(reading) = rx.recv().await {
+        let _ = ch_tx.send(reading.clone()).await;
+        let _ = health_tx.send(reading.clone()).await;
+        let _ = buffer_tx.send(reading).await;
+    }
+}
+
+async fn start_udp_receivers(
+    ch_tx: mpsc::Sender<SensorReading>,
+    health_tx: mpsc::Sender<SensorReading>,
+    buffer_tx: mpsc::Sender<SensorReading>,
+) -> Result<()> {
+    let mut dispatchers: HashMap<u16, mpsc::Sender<SensorReading>> = HashMap::new();
+
+    for mid in 1..=40u16 {
+        let (tx, rx) = mpsc::channel::<SensorReading>(2000);
+        let ch = ch_tx.clone();
+        let ht = health_tx.clone();
+        let bt = buffer_tx.clone();
+        tokio::spawn(machine_dispatch_task(mid, rx, ch, ht, bt));
+        dispatchers.insert(mid, tx);
+    }
+
+    let dispatchers = Arc::new(dispatchers);
+    let (fallback_tx, mut fallback_rx) = mpsc::channel::<SensorReading>(10000);
+
+    tokio::spawn(async move {
+        while let Some(reading) = fallback_rx.recv().await {
+            let _ = ch_tx.send(reading.clone()).await;
+            let _ = health_tx.send(reading.clone()).await;
+            let _ = buffer_tx.send(reading).await;
+        }
+    });
+
+    for shard in 0..UDP_PORT_COUNT {
+        let port = UDP_PORT + shard;
+        let disp = dispatchers.clone();
+        let fb = fallback_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = udp_receiver_single(port, disp, fb).await {
+                error!("UDP receiver on port {} failed: {}", port, e);
+            }
+        });
+    }
+
+    let legacy_socket = UdpSocket::bind(format!("0.0.0.0:{}", UDP_PORT)).await;
+    if let Ok(socket) = legacy_socket {
+        info!("Legacy single-port UDP receiver also bound on {}", UDP_PORT);
+    }
+
+    Ok(())
 }
 
 async fn clickhouse_writer(
@@ -389,14 +456,158 @@ async fn alert_monitor(state: Arc<AppState>) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ISO22400Alert {
+    #[serde(rename = "MessageHeader")]
+    message_header: ISO22400Header,
+    #[serde(rename = "Payload")]
+    payload: ISO22400Payload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ISO22400Header {
+    #[serde(rename = "MessageID")]
+    message_id: String,
+    #[serde(rename = "Timestamp")]
+    timestamp: String,
+    #[serde(rename = "MessageType")]
+    message_type: String,
+    #[serde(rename = "Sender")]
+    sender: String,
+    #[serde(rename = "Receiver")]
+    receiver: String,
+    #[serde(rename = "SchemaVersion")]
+    schema_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ISO22400Payload {
+    #[serde(rename = "EquipmentID")]
+    equipment_id: String,
+    #[serde(rename = "EquipmentName")]
+    equipment_name: String,
+    #[serde(rename = "Location")]
+    location: String,
+    #[serde(rename = "AlertCode")]
+    alert_code: String,
+    #[serde(rename = "AlertLevel")]
+    alert_level: String,
+    #[serde(rename = "AlertCategory")]
+    alert_category: String,
+    #[serde(rename = "AlertDescription")]
+    alert_description: String,
+    #[serde(rename = "MeasuredValue")]
+    measured_value: f64,
+    #[serde(rename = "ThresholdValue")]
+    threshold_value: f64,
+    #[serde(rename = "UnitOfMeasure")]
+    unit_of_measure: String,
+    #[serde(rename = "Severity")]
+    severity: String,
+    #[serde(rename = "RecommendedAction")]
+    recommended_action: String,
+    #[serde(rename = "KPI")]
+    kpi: ISO22400KPI,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ISO22400KPI {
+    #[serde(rename = "KPIID")]
+    kpi_id: String,
+    #[serde(rename = "KPIName")]
+    kpi_name: String,
+    #[serde(rename = "KPIValue")]
+    kpi_value: f64,
+    #[serde(rename = "KPIUnit")]
+    kpi_unit: String,
+    #[serde(rename = "KPICategory")]
+    kpi_category: String,
+}
+
+fn convert_to_iso22400(alert: &AlertRecord) -> ISO22400Alert {
+    let (alert_code, alert_category, unit, kpi_name, kpi_unit, recommended) = match alert.alert_type.as_str() {
+        "vibration_alert" => (
+            "VIB-ALERT-001".to_string(),
+            "ConditionMonitoring".to_string(),
+            "mm/s".to_string(),
+            "VibrationSeverity".to_string(),
+            "mm/s".to_string(),
+            "Inspect spindle bearings; schedule vibration analysis; consider reducing spindle speed".to_string(),
+        ),
+        "rul_warning" => (
+            "RUL-WARN-001".to_string(),
+            "PredictiveMaintenance".to_string(),
+            "hours".to_string(),
+            "RemainingUsefulLife".to_string(),
+            "h".to_string(),
+            "Schedule bearing replacement at next maintenance window; order replacement parts".to_string(),
+        ),
+        _ => (
+            "GEN-ALERT-001".to_string(),
+            "General".to_string(),
+            "unit".to_string(),
+            "GenericKPI".to_string(),
+            "unit".to_string(),
+            "Review equipment condition".to_string(),
+        ),
+    };
+
+    let severity = match alert.alert_level.as_str() {
+        "level-1" => "Warning",
+        "level-2" => "Critical",
+        _ => "Info",
+    };
+
+    let kpi_category = match alert.alert_type.as_str() {
+        "vibration_alert" => "OEE_Quality",
+        "rul_warning" => "OEE_Availability",
+        _ => "OEE",
+    };
+
+    ISO22400Alert {
+        message_header: ISO22400Header {
+            message_id: alert.id.clone(),
+            timestamp: alert.timestamp.clone(),
+            message_type: "EquipmentAlert".to_string(),
+            sender: "SpindleMonitorSystem".to_string(),
+            receiver: "MES".to_string(),
+            schema_version: "ISO22400-2:2014".to_string(),
+        },
+        payload: ISO22400Payload {
+            equipment_id: format!("CNC-{:03}", alert.machine_id),
+            equipment_name: format!("FiveAxisCNC-{}", alert.machine_id),
+            location: format!("Workshop-A/Bay-{}", (alert.machine_id - 1) / 5 + 1),
+            alert_code,
+            alert_level: alert.alert_level.clone(),
+            alert_category,
+            alert_description: alert.message.clone(),
+            measured_value: alert.value,
+            threshold_value: alert.threshold,
+            unit_of_measure: unit,
+            severity: severity.to_string(),
+            recommended_action: recommended,
+            kpi: ISO22400KPI {
+                kpi_id: format!("KPI-{}-{}", alert.machine_id, alert.alert_type),
+                kpi_name,
+                kpi_value: alert.value,
+                kpi_unit: kpi_unit,
+                kpi_category: kpi_category.to_string(),
+            },
+        },
+    }
+}
+
 async fn publish_mqtt_alert(state: &Arc<AppState>, alert: &AlertRecord) {
     let mut client_lock = state.mqtt_client.lock().await;
     if let Some(ref mut client) = *client_lock {
         let topic = format!("spindle/alerts/{}", alert.machine_id);
         let payload = serde_json::to_string(alert).unwrap_or_default();
         let _ = client.publish(topic, QoS::AtLeastOnce, false, payload.as_bytes());
+
         let mes_topic = format!("mes/spindle/alerts/{}", alert.machine_id);
-        let _ = client.publish(mes_topic, QoS::AtLeastOnce, false, payload.as_bytes());
+        let iso_alert = convert_to_iso22400(alert);
+        let iso_payload = serde_json::to_string(&iso_alert).unwrap_or_default();
+        let _ = client.publish(mes_topic, QoS::AtLeastOnce, false, iso_payload.as_bytes());
     }
 }
 
@@ -456,7 +667,13 @@ async fn health_updater(state: Arc<AppState>, mut rx: mpsc::Receiver<SensorReadi
                         alert_tracker.remove(&(*machine_id, 0u8));
                     }
 
-                    let rul_result = state.rul_predictor.predict_rul(
+                    let condition = classify_operating_condition(avg_rpm, avg_vib_rms);
+                    let feature_vec = normalize_features(
+                        avg_vib_rms, avg_temp, 0.05, avg_disp, avg_rpm,
+                        health_score_obj.score as f64, condition,
+                    );
+                    let rul_result = state.rul_predictor.predict_rul_for_machine(
+                        *machine_id,
                         avg_rpm,
                         avg_vib_rms,
                         avg_temp,
@@ -464,7 +681,7 @@ async fn health_updater(state: Arc<AppState>, mut rx: mpsc::Receiver<SensorReadi
                         5.0,
                         0.1,
                         &[avg_vib_rms; 48],
-                        &vec![Array1::from_vec(vec![avg_vib_rms, avg_temp, 0.05, avg_disp, avg_rpm, health_score_obj.score as f64]); 48],
+                        &vec![feature_vec.clone(); 48],
                     );
 
                     let maint_orders = state.rul_predictor.generate_maintenance_orders(*machine_id, &rul_result);
@@ -742,7 +959,13 @@ async fn get_machine_rul(
     let map = state.health_map.read().await;
     match map.get(&machine_id) {
         Some(health) => {
-            let rul_result = state.rul_predictor.predict_rul(
+            let condition = classify_operating_condition(health.rpm, health.vibration_rms);
+            let feature_vec = normalize_features(
+                health.vibration_rms, health.temperature, 0.05, health.displacement,
+                health.rpm, health.health_score as f64, condition,
+            );
+            let rul_result = state.rul_predictor.predict_rul_for_machine(
+                machine_id,
                 health.rpm,
                 health.vibration_rms,
                 health.temperature,
@@ -750,7 +973,7 @@ async fn get_machine_rul(
                 5.0,
                 0.1,
                 &[health.vibration_rms; 48],
-                &vec![Array1::from_vec(vec![health.vibration_rms, health.temperature, 0.05, health.displacement, health.rpm, health.health_score as f64]); 48],
+                &vec![feature_vec.clone(); 48],
             );
             HttpResponse::Ok().json(serde_json::json!({
                 "machine_id": machine_id,
@@ -866,17 +1089,12 @@ async fn main() -> Result<()> {
         ch_client: ch_client.clone(),
     });
 
-    let (udp_tx, udp_rx) = mpsc::channel::<SensorReading>(100_000);
-    let (ch_tx, ch_rx) = mpsc::channel::<SensorReading>(50_000);
-    let (health_tx, health_rx) = mpsc::channel::<SensorReading>(50_000);
-    let (buffer_tx, buffer_rx) = mpsc::channel::<SensorReading>(50_000);
+    let (ch_tx, ch_rx) = mpsc::channel::<SensorReading>(100_000);
+    let (health_tx, health_rx) = mpsc::channel::<SensorReading>(100_000);
+    let (buffer_tx, buffer_rx) = mpsc::channel::<SensorReading>(100_000);
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = udp_receiver(udp_tx).await {
-            error!("UDP receiver error: {}", e);
-        }
-    });
+    start_udp_receivers(ch_tx.clone(), health_tx.clone(), buffer_tx.clone()).await?;
+    info!("Multi-port async UDP receivers started (ports {}-{})", UDP_PORT, UDP_PORT + UDP_PORT_COUNT - 1);
 
     let ch_client_clone = ch_client.clone();
     tokio::spawn(async move {
@@ -903,15 +1121,6 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = alert_monitor(state_alert).await {
             error!("Alert monitor error: {}", e);
-        }
-    });
-
-    tokio::spawn(async move {
-        let mut rx = udp_rx;
-        while let Some(reading) = rx.recv().await {
-            let _ = ch_tx.send(reading.clone()).await;
-            let _ = health_tx.send(reading.clone()).await;
-            let _ = buffer_tx.send(reading).await;
         }
     });
 
