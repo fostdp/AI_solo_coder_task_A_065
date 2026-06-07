@@ -1,380 +1,356 @@
-use crate::config::Config;
-use crate::models::*;
-use log::{info, error, warn};
-use std::sync::Arc;
-use klickhouse::{Client, ClientBuilder, Row, Uuid, DateTime64};
-use chrono::{DateTime, Utc, Duration};
+use clickhouse_rs::{Client, Pool, Options, Compression};
+use chrono::{DateTime, Utc, TimeZone};
+use tracing::{info, error};
+use uuid::Uuid;
 
-#[derive(Clone)]
+use crate::config::Config;
+use crate::models::{ProcessedMetrics, Alarm, RULPrediction, MachineStatus, HealthRanking, MonthlyStats, SensorHistory};
+
 pub struct ClickHouseClient {
-    client: Arc<Client>,
-    config: Arc<Config>,
+    pool: Pool,
+    database: String,
 }
 
 impl ClickHouseClient {
-    pub async fn new(config: Arc<Config>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{}?database={}", config.clickhouse_url, config.clickhouse_database);
-        let client = ClientBuilder::default()
-            .with_host(&config.clickhouse_url)
-            .with_database(&config.clickhouse_database)
-            .with_username(&config.clickhouse_user)
-            .with_password(&config.clickhouse_password)
-            .connect()
-            .await?;
+    pub async fn new(config: &Config) -> anyhow::Result<Self> {
+        let url = format!(
+            "tcp://{}:{}@{}:{}/{}",
+            config.clickhouse.username,
+            config.clickhouse.password,
+            config.clickhouse.host,
+            config.clickhouse.port,
+            config.clickhouse.database
+        );
+
+        let options = Options::new(url)
+            .compression(Compression::None)
+            .connection_timeout(std::time::Duration::from_secs(10));
         
-        info!("ClickHouse连接成功: {}", url);
+        let pool = Pool::new(options);
+        
+        let mut client = pool.get_handle().await?;
+        info!("Connected to ClickHouse successfully");
+        
+        client.execute(format!("USE {}", config.clickhouse.database)).await?;
+
         Ok(Self {
-            client: Arc::new(client),
-            config,
+            pool,
+            database: config.clickhouse.database.clone(),
         })
     }
 
-    pub async fn insert_vibration_data(&self, data: &SensorData) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut rows = Vec::new();
-        for vib in &data.vibration {
-            rows.push(VibrationRow {
-                timestamp: DateTime64::new(data.timestamp.timestamp_millis()),
-                machine_id: data.machine_id,
-                sensor_id: vib.sensor_id,
-                x_axis: vib.x,
-                y_axis: vib.y,
-                z_axis: vib.z,
-                rms: vib.rms,
-                peak: vib.peak,
-                crest_factor: vib.crest_factor,
-                spindle_speed: data.spindle_speed,
-            });
-        }
-        self.client.insert_native("vibration_data", rows).await?;
-        Ok(())
-    }
+    pub async fn insert_metrics(&self, metrics: &ProcessedMetrics) -> anyhow::Result<()> {
+        let mut client = self.pool.get_handle().await?;
+        
+        let ts: DateTime<Utc> = metrics.timestamp;
+        let ts_ms = ts.timestamp_millis();
 
-    pub async fn insert_temperature_data(&self, data: &SensorData) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut rows = Vec::new();
-        for temp in &data.temperature {
-            rows.push(TemperatureRow {
-                timestamp: DateTime64::new(data.timestamp.timestamp_millis()),
-                machine_id: data.machine_id,
-                sensor_id: temp.sensor_id,
-                value: temp.value,
-                spindle_speed: data.spindle_speed,
-            });
-        }
-        self.client.insert_native("temperature_data", rows).await?;
-        Ok(())
-    }
+        let vibration_blob: Vec<u8> = metrics.vibration.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let temperature_blob: Vec<u8> = metrics.temperature.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let displacement_blob: Vec<u8> = metrics.displacement.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let rms_blob: Vec<u8> = metrics.vibration_rms.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let peak_blob: Vec<u8> = metrics.vibration_peak.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
 
-    pub async fn insert_displacement_data(&self, data: &SensorData) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut rows = Vec::new();
-        for disp in &data.displacement {
-            rows.push(DisplacementRow {
-                timestamp: DateTime64::new(data.timestamp.timestamp_millis()),
-                machine_id: data.machine_id,
-                sensor_id: disp.sensor_id,
-                axial: disp.axial,
-                radial: disp.radial,
-                spindle_speed: data.spindle_speed,
-            });
-        }
-        self.client.insert_native("displacement_data", rows).await?;
-        Ok(())
-    }
-
-    pub async fn insert_machine_status(&self, status: &MachineStatus) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let row = MachineStatusRow {
-            timestamp: DateTime64::new(status.last_update.timestamp_millis()),
-            machine_id: status.machine_id,
-            health_score: status.health_score,
-            rul_hours: status.rul_hours,
-            max_vibration_rms: status.max_vibration_rms,
-            max_temperature: status.max_temperature,
-            alarm_status: status.alarm_status as u8,
-            avg_spindle_speed: 0.0,
-        };
-        self.client.insert_native("machine_status", vec![row]).await?;
-        Ok(())
-    }
-
-    pub async fn insert_rul_prediction(&self, prediction: &RULPrediction) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let row = RULPredictionRow {
-            timestamp: DateTime64::new(prediction.timestamp.timestamp_millis()),
-            machine_id: prediction.machine_id,
-            rul_hours: prediction.rul_hours,
-            confidence: prediction.confidence,
-            avg_rms: prediction.avg_rms,
-            temp_rate: prediction.temp_rate,
-            bearing_life_hours: prediction.bearing_life_hours,
-            model_version: "v1.0".to_string(),
-        };
-        self.client.insert_native("rul_predictions", vec![row]).await?;
-        Ok(())
-    }
-
-    pub async fn insert_alarm_event(&self, alarm: &AlarmEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let row = AlarmEventRow {
-            id: alarm.id.clone(),
-            timestamp: DateTime64::new(alarm.timestamp.timestamp_millis()),
-            machine_id: alarm.machine_id,
-            sensor_type: alarm.sensor_type.clone(),
-            sensor_id: alarm.sensor_id,
-            level: alarm.level as u8,
-            message: alarm.message.clone(),
-            value: alarm.value,
-            threshold: alarm.threshold,
-            acknowledged: 0,
-        };
-        self.client.insert_native("alarm_events", vec![row]).await?;
-        Ok(())
-    }
-
-    pub async fn insert_work_order(&self, order: &WorkOrder) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let row = WorkOrderRow {
-            id: order.id.clone(),
-            machine_id: order.machine_id,
-            created_at: DateTime64::new(order.created_at.timestamp_millis()),
-            rul_hours: order.rul_hours,
-            priority: order.priority.clone(),
-            description: order.description.clone(),
-            status: order.status.clone(),
-        };
-        self.client.insert_native("work_orders", vec![row]).await?;
-        Ok(())
-    }
-
-    pub async fn get_sensor_history(&self, machine_id: u16, sensor_type: &str, sensor_id: u8, hours: u32) -> Result<Vec<SensorHistoryPoint>, Box<dyn std::error::Error + Send + Sync>> {
-        let since = Utc::now() - Duration::hours(hours as i64);
-        let table = match sensor_type {
-            "vibration" => "vibration_data",
-            "temperature" => "temperature_data",
-            _ => return Err("Invalid sensor type".into()),
-        };
+        let freq_blob: Vec<u8> = metrics.vibration_freq.iter()
+            .flat_map(|arr| arr.iter().flat_map(|v| v.to_le_bytes()))
+            .collect();
 
         let query = format!(
-            "SELECT timestamp, rms as value FROM {} WHERE machine_id = {} AND sensor_id = {} AND timestamp >= toDateTime64({}, 3) ORDER BY timestamp",
-            table, machine_id, sensor_id, since.timestamp_millis()
+            "INSERT INTO machine_metrics \
+             (timestamp, machine_id, spindle_id, vibration, temperature, displacement, rpm, \
+              vibration_rms, vibration_peak, vibration_freq) \
+             VALUES ({}, {}, {}, [{}], [{}], [{}], {}, [{}], [{}], [{}])",
+            ts_ms,
+            metrics.machine_id,
+            metrics.spindle_id,
+            metrics.vibration.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "),
+            metrics.temperature.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "),
+            metrics.displacement.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "),
+            metrics.rpm,
+            metrics.vibration_rms.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "),
+            metrics.vibration_peak.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "),
+            metrics.vibration_freq.iter()
+                .map(|arr| format!("[{}]", arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")))
+                .collect::<Vec<_>>().join(", ")
         );
 
-        let rows: Vec<SensorHistoryPoint> = self.client.query_collect(query).await?;
-        Ok(rows)
+        client.execute(query).await?;
+        Ok(())
     }
 
-    pub async fn get_all_machine_status(&self) -> Result<Vec<MachineStatus>, Box<dyn std::error::Error + Send + Sync>> {
-        let query = r#"
-            SELECT 
-                m.machine_id,
-                m.machine_name,
-                ms.health_score,
-                ms.rul_hours,
-                ms.max_vibration_rms,
-                ms.max_temperature,
-                ms.alarm_status,
-                ms.timestamp as last_update
-            FROM machines m
-            LEFT JOIN (
-                SELECT 
-                    machine_id,
-                    argMax(health_score, timestamp) as health_score,
-                    argMax(rul_hours, timestamp) as rul_hours,
-                    argMax(max_vibration_rms, timestamp) as max_vibration_rms,
-                    argMax(max_temperature, timestamp) as max_temperature,
-                    argMax(alarm_status, timestamp) as alarm_status,
-                    max(timestamp) as timestamp
-                FROM machine_status
-                WHERE timestamp > now() - INTERVAL 5 MINUTE
-                GROUP BY machine_id
-            ) ms ON m.machine_id = ms.machine_id
-            ORDER BY m.machine_id
-        "#;
+    pub async fn insert_alarm(&self, alarm: &Alarm) -> anyhow::Result<()> {
+        let mut client = self.pool.get_handle().await?;
+        let ts_ms = alarm.timestamp.timestamp_millis();
 
-        let rows: Vec<MachineStatusRow> = self.client.query_collect(query).await?;
-        let statuses = rows.into_iter().map(|r| MachineStatus {
-            machine_id: r.machine_id,
-            health_score: r.health_score.unwrap_or(100.0),
-            rul_hours: r.rul_hours.unwrap_or(10000.0),
-            max_vibration_rms: r.max_vibration_rms.unwrap_or(0.0),
-            max_temperature: r.max_temperature.unwrap_or(25.0),
-            alarm_status: match r.alarm_status.unwrap_or(0) {
-                2 => AlarmLevel::Critical,
-                1 => AlarmLevel::Warning,
-                _ => AlarmLevel::Normal,
-            },
-            last_update: Utc::now(),
-        }).collect();
+        let query = format!(
+            "INSERT INTO alarms \
+             (timestamp, machine_id, alarm_type, alarm_level, message, sensor_index, value, threshold) \
+             VALUES ({}, {}, '{}', {}, '{}', {}, {}, {})",
+            ts_ms,
+            alarm.machine_id,
+            alarm.alarm_type,
+            alarm.alarm_level,
+            alarm.message.replace('\'', "''"),
+            alarm.sensor_index,
+            alarm.value,
+            alarm.threshold
+        );
 
-        Ok(statuses)
+        client.execute(query).await?;
+        Ok(())
     }
 
-    pub async fn get_monthly_stats(&self) -> Result<MonthlyStats, Box<dyn std::error::Error + Send + Sync>> {
-        let query = r#"
-            SELECT
-                count() as total_alarms,
-                countIf(level = 2) as critical_alarms,
-                countIf(level = 1) as warning_alarms
-            FROM alarm_events
-            WHERE timestamp >= toStartOfMonth(now())
-        "#;
+    pub async fn insert_rul_prediction(&self, pred: &RULPrediction) -> anyhow::Result<()> {
+        let mut client = self.pool.get_handle().await?;
+        let ts_ms = pred.timestamp.timestamp_millis();
 
-        let rows: Vec<(u32, u32, u32)> = self.client.query_collect(query).await?;
-        let (total, critical, warning) = rows.first().unwrap_or(&(0, 0, 0));
+        let query = format!(
+            "INSERT INTO rul_history \
+             (timestamp, machine_id, rul_hours, health_score, vibration_trend, temperature_trend, model_source) \
+             VALUES ({}, {}, {}, {}, {}, {}, '{}')",
+            ts_ms,
+            pred.machine_id,
+            pred.rul_hours,
+            pred.health_score,
+            pred.vibration_trend,
+            pred.temperature_trend,
+            pred.model_source
+        );
 
-        let stats = MonthlyStats {
-            month: chrono::Local::now().format("%Y-%m").to_string(),
-            total_alarms: *total,
-            critical_alarms: *critical,
-            warning_alarms: *warning,
-            avg_health_score: 85.5,
-            machines_maintained: 3,
-        };
+        client.execute(query).await?;
+        Ok(())
+    }
+
+    pub async fn update_machine_status(&self, status: &MachineStatus) -> anyhow::Result<()> {
+        let mut client = self.pool.get_handle().await?;
+        let ts_ms = status.last_update.timestamp_millis();
+
+        let query = format!(
+            "INSERT INTO machine_status \
+             (machine_id, last_update, health_score, rul_hours, vibration_severity, avg_temperature, alarm_level, total_runtime_hours) \
+             VALUES ({}, {}, {}, {}, [{}], [{}], {}, {})",
+            status.machine_id,
+            ts_ms,
+            status.health_score,
+            status.rul_hours,
+            status.vibration_severity.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "),
+            status.avg_temperature.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "),
+            status.alarm_level,
+            status.total_runtime_hours
+        );
+
+        client.execute(query).await?;
+        Ok(())
+    }
+
+    pub async fn create_maintenance_order(&self, machine_id: u16, description: &str, estimated_rul: f64) -> anyhow::Result<Uuid> {
+        let mut client = self.pool.get_handle().await?;
+        let order_id = Uuid::new_v4();
+        let now = Utc::now().timestamp_millis();
+
+        let query = format!(
+            "INSERT INTO maintenance_orders \
+             (order_id, created_at, machine_id, order_type, priority, description, estimated_rul, status) \
+             VALUES ('{}', {}, {}, 'bearing_replacement', 'high', '{}', {}, 'pending')",
+            order_id,
+            now,
+            machine_id,
+            description.replace('\'', "''"),
+            estimated_rul
+        );
+
+        client.execute(query).await?;
+        Ok(order_id)
+    }
+
+    pub async fn get_health_ranking(&self, limit: usize) -> anyhow::Result<Vec<HealthRanking>> {
+        let mut client = self.pool.get_handle().await?;
+        
+        let query = format!(
+            "SELECT machine_id, health_score, rul_hours, alarm_level \
+             FROM machine_status \
+             ORDER BY health_score DESC \
+             LIMIT {}",
+            limit
+        );
+
+        let mut cursor = client.query(query).await?;
+        let mut rankings = Vec::new();
+        let mut rank = 1u16;
+
+        while let Some(row) = cursor.next().await? {
+            let machine_id: u16 = row.get("machine_id")?;
+            let health_score: f64 = row.get("health_score")?;
+            let rul_hours: f64 = row.get("rul_hours")?;
+            let alarm_level: u8 = row.get("alarm_level")?;
+
+            rankings.push(HealthRanking {
+                machine_id,
+                health_score,
+                rul_hours,
+                alarm_level,
+                rank,
+            });
+            rank += 1;
+        }
+
+        Ok(rankings)
+    }
+
+    pub async fn get_monthly_stats(&self, month: &str) -> anyhow::Result<Vec<MonthlyStats>> {
+        let mut client = self.pool.get_handle().await?;
+
+        let query = format!(
+            "SELECT month, machine_id, total_runtime, vibration_alerts, \
+                    temperature_alerts, maintenance_count, avg_health_score \
+             FROM monthly_stats \
+             WHERE month = '{}' \
+             ORDER BY machine_id",
+            month
+        );
+
+        let mut cursor = client.query(query).await?;
+        let mut stats = Vec::new();
+
+        while let Some(row) = cursor.next().await? {
+            let month_val: chrono::NaiveDate = row.get("month")?;
+            stats.push(MonthlyStats {
+                month: month_val.format("%Y-%m").to_string(),
+                machine_id: row.get("machine_id")?,
+                total_runtime: row.get("total_runtime")?,
+                vibration_alerts: row.get("vibration_alerts")?,
+                temperature_alerts: row.get("temperature_alerts")?,
+                maintenance_count: row.get("maintenance_count")?,
+                avg_health_score: row.get("avg_health_score")?,
+            });
+        }
 
         Ok(stats)
     }
 
-    pub async fn get_recent_alarms(&self, limit: u32) -> Result<Vec<AlarmEvent>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_sensor_history(&self, machine_id: u16, sensor_index: usize, hours: u32) -> anyhow::Result<SensorHistory> {
+        let mut client = self.pool.get_handle().await?;
+        let now = Utc::now();
+        let since = now - chrono::Duration::hours(hours as i64);
+        let since_ms = since.timestamp_millis();
+
         let query = format!(
-            "SELECT * FROM alarm_events ORDER BY timestamp DESC LIMIT {}",
-            limit
+            "SELECT timestamp, vibration_rms[{}] as rms, vibration_freq \
+             FROM machine_metrics \
+             WHERE machine_id = {} AND timestamp >= {} \
+             ORDER BY timestamp ASC",
+            sensor_index + 1,
+            machine_id,
+            since_ms
         );
-        let rows: Vec<AlarmEventRow> = self.client.query_collect(query).await?;
-        let alarms = rows.into_iter().map(|r| AlarmEvent {
-            id: r.id,
-            timestamp: Utc::now(),
-            machine_id: r.machine_id,
-            sensor_type: r.sensor_type,
-            sensor_id: r.sensor_id,
-            level: match r.level {
-                2 => AlarmLevel::Critical,
-                1 => AlarmLevel::Warning,
-                _ => AlarmLevel::Normal,
-            },
-            message: r.message,
-            value: r.value,
-            threshold: r.threshold,
-            acknowledged: r.acknowledged > 0,
-        }).collect();
 
-        Ok(alarms)
+        let mut cursor = client.query(query).await?;
+        let mut timestamps = Vec::new();
+        let mut values = Vec::new();
+        let mut spectrum = Vec::new();
+        let mut frequencies = Vec::new();
+
+        while let Some(row) = cursor.next().await? {
+            let ts: i64 = row.get("timestamp")?;
+            let rms: f64 = row.get("rms")?;
+            
+            timestamps.push(ts);
+            values.push(rms);
+        }
+
+        if frequencies.is_empty() && !values.is_empty() {
+            let sample_rate = 10.0;
+            for i in 0..128 {
+                frequencies.push(i as f64 * sample_rate / 128.0);
+            }
+        }
+
+        Ok(SensorHistory {
+            timestamps,
+            values,
+            frequencies,
+            spectrum,
+        })
     }
 
-    pub async fn get_vibration_timeseries(&self, machine_id: u16, sensor_id: u8, duration_minutes: u32) -> Result<Vec<TimeSeriesPoint>, Box<dyn std::error::Error + Send + Sync>> {
-        let since = Utc::now() - Duration::minutes(duration_minutes as i64);
+    pub async fn get_machine_status(&self, machine_id: u16) -> anyhow::Result<Option<MachineStatus>> {
+        let mut client = self.pool.get_handle().await?;
+
         let query = format!(
-            "SELECT timestamp, rms as value FROM vibration_data WHERE machine_id = {} AND sensor_id = {} AND timestamp >= toDateTime64({}, 3) ORDER BY timestamp",
-            machine_id, sensor_id, since.timestamp_millis()
+            "SELECT machine_id, last_update, health_score, rul_hours, \
+                    vibration_severity, avg_temperature, alarm_level, total_runtime_hours \
+             FROM machine_status \
+             WHERE machine_id = {} \
+             ORDER BY last_update DESC \
+             LIMIT 1",
+            machine_id
         );
-        let rows: Vec<TimeSeriesRow> = self.client.query_collect(query).await?;
-        let points = rows.into_iter().map(|r| TimeSeriesPoint {
-            timestamp: DateTime::from_utc(chrono::NaiveDateTime::from_timestamp_opt(r.timestamp.0 / 1000, 0).unwrap_or_default(), Utc),
-            value: r.value,
-        }).collect();
-        Ok(points)
+
+        let mut cursor = client.query(query).await?;
+        
+        if let Some(row) = cursor.next().await? {
+            let ts: i64 = row.get("last_update")?;
+            let last_update = Utc.timestamp_millis_opt(ts).single().unwrap_or_else(Utc::now);
+
+            Ok(Some(MachineStatus {
+                machine_id: row.get("machine_id")?,
+                last_update,
+                health_score: row.get("health_score")?,
+                rul_hours: row.get("rul_hours")?,
+                vibration_severity: row.get("vibration_severity")?,
+                avg_temperature: row.get("avg_temperature")?,
+                alarm_level: row.get("alarm_level")?,
+                total_runtime_hours: row.get("total_runtime_hours")?,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
-    pub async fn get_sensor_positions(&self) -> Result<Vec<SensorPosition>, Box<dyn std::error::Error + Send + Sync>> {
-        let query = "SELECT sensor_id, name, x, y, location FROM sensor_positions WHERE sensor_type = 'vibration' ORDER BY sensor_id";
-        let rows: Vec<(u8, String, f64, f64, String)> = self.client.query_collect(query).await?;
-        let positions = rows.into_iter().map(|(id, name, x, y, location)| SensorPosition {
-            id, name, x, y, location
-        }).collect();
-        Ok(positions)
+    pub async fn get_all_machine_statuses(&self) -> anyhow::Result<Vec<MachineStatus>> {
+        let mut client = self.pool.get_handle().await?;
+
+        let query = "\
+            SELECT machine_id, max(last_update) as last_update, \
+                   argMax(health_score, last_update) as health_score, \
+                   argMax(rul_hours, last_update) as rul_hours, \
+                   argMax(vibration_severity, last_update) as vibration_severity, \
+                   argMax(avg_temperature, last_update) as avg_temperature, \
+                   argMax(alarm_level, last_update) as alarm_level, \
+                   argMax(total_runtime_hours, last_update) as total_runtime_hours \
+            FROM machine_status \
+            GROUP BY machine_id \
+            ORDER BY machine_id".to_string();
+
+        let mut cursor = client.query(query).await?;
+        let mut statuses = Vec::new();
+
+        while let Some(row) = cursor.next().await? {
+            let ts: i64 = row.get("last_update")?;
+            let last_update = Utc.timestamp_millis_opt(ts).single().unwrap_or_else(Utc::now);
+
+            statuses.push(MachineStatus {
+                machine_id: row.get("machine_id")?,
+                last_update,
+                health_score: row.get("health_score")?,
+                rul_hours: row.get("rul_hours")?,
+                vibration_severity: row.get("vibration_severity")?,
+                avg_temperature: row.get("avg_temperature")?,
+                alarm_level: row.get("alarm_level")?,
+                total_runtime_hours: row.get("total_runtime_hours")?,
+            });
+        }
+
+        Ok(statuses)
     }
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct VibrationRow {
-    pub timestamp: DateTime64,
-    pub machine_id: u16,
-    pub sensor_id: u8,
-    pub x_axis: f64,
-    pub y_axis: f64,
-    pub z_axis: f64,
-    pub rms: f64,
-    pub peak: f64,
-    pub crest_factor: f64,
-    pub spindle_speed: f64,
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct TemperatureRow {
-    pub timestamp: DateTime64,
-    pub machine_id: u16,
-    pub sensor_id: u8,
-    pub value: f64,
-    pub spindle_speed: f64,
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct DisplacementRow {
-    pub timestamp: DateTime64,
-    pub machine_id: u16,
-    pub sensor_id: u8,
-    pub axial: f64,
-    pub radial: f64,
-    pub spindle_speed: f64,
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct MachineStatusRow {
-    pub timestamp: DateTime64,
-    pub machine_id: u16,
-    pub health_score: Option<f64>,
-    pub rul_hours: Option<f64>,
-    pub max_vibration_rms: Option<f64>,
-    pub max_temperature: Option<f64>,
-    pub alarm_status: Option<u8>,
-    pub avg_spindle_speed: f64,
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct RULPredictionRow {
-    pub timestamp: DateTime64,
-    pub machine_id: u16,
-    pub rul_hours: f64,
-    pub confidence: f64,
-    pub avg_rms: f64,
-    pub temp_rate: f64,
-    pub bearing_life_hours: f64,
-    pub model_version: String,
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct AlarmEventRow {
-    pub id: String,
-    pub timestamp: DateTime64,
-    pub machine_id: u16,
-    pub sensor_type: String,
-    pub sensor_id: Option<u8>,
-    pub level: u8,
-    pub message: String,
-    pub value: f64,
-    pub threshold: f64,
-    pub acknowledged: u8,
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct WorkOrderRow {
-    pub id: String,
-    pub machine_id: u16,
-    pub created_at: DateTime64,
-    pub rul_hours: f64,
-    pub priority: String,
-    pub description: String,
-    pub status: String,
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct SensorHistoryPoint {
-    pub timestamp: DateTime64,
-    pub value: f64,
-}
-
-#[derive(Row, Debug, Clone)]
-pub struct TimeSeriesRow {
-    pub timestamp: DateTime64,
-    pub value: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct TimeSeriesPoint {
-    pub timestamp: DateTime<Utc>,
-    pub value: f64,
 }

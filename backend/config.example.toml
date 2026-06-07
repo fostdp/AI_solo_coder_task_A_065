@@ -1,0 +1,32 @@
+[server]
+udp_port = 5555
+http_port = 8080
+websocket_port = 8081
+
+[clickhouse]
+host = "localhost"
+port = 9000
+database = "cnc_monitor"
+username = "default"
+password = ""
+
+[mqtt]
+broker = "tcp://localhost:1883"
+client_id = "cnc_monitor_backend"
+topic_alarm = "cnc/alarm"
+topic_status = "cnc/status"
+
+[monitoring]
+vibration_warning = 2.8
+vibration_alarm = 7.1
+vibration_alarm_duration_sec = 10
+rul_warning_threshold = 500
+rul_alarm_threshold = 200
+health_score_update_interval_sec = 60
+rul_prediction_interval_sec = 300
+
+[machines]
+count = 40
+sensors_vibration = 8
+sensors_temperature = 4
+sensors_displacement = 2

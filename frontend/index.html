@@ -3,149 +3,182 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>精密数控机床主轴健康监控与剩余寿命预测系统</title>
-    <link rel="stylesheet" href="css/style.css">
+    <title>精密数控机床主轴健康监控系统</title>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <header class="header">
-        <div class="header-left">
-            <h1>🔧 主轴健康监控中心</h1>
-            <span class="subtitle">航空零部件加工车间 · 五轴数控机床群</span>
-        </div>
-        <div class="header-right">
-            <div class="status-badge online">
-                <span class="dot"></span>
-                系统在线
-            </div>
-            <div class="time-display" id="current-time"></div>
+        <h1>精密数控机床主轴健康监控与剩余寿命预测系统</h1>
+        <div class="header-info">
+            <span id="current-time">--:--:--</span>
+            <span class="status-badge online">系统在线</span>
         </div>
     </header>
 
     <div class="main-container">
         <aside class="sidebar">
             <div class="sidebar-section">
-                <h3>📊 本月统计</h3>
-                <div class="stats-grid" id="monthly-stats">
-                    <div class="stat-card">
-                        <div class="stat-value" id="stat-total-alarms">-</div>
-                        <div class="stat-label">总告警数</div>
-                    </div>
-                    <div class="stat-card critical">
-                        <div class="stat-value" id="stat-critical">-</div>
-                        <div class="stat-label">严重告警</div>
-                    </div>
-                    <div class="stat-card warning">
-                        <div class="stat-value" id="stat-warning">-</div>
-                        <div class="stat-label">预警</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value" id="stat-health">-</div>
-                        <div class="stat-label">平均健康分</div>
-                    </div>
+                <h3>机床列表</h3>
+                <div class="machine-list" id="machine-list">
                 </div>
             </div>
-
             <div class="sidebar-section">
-                <h3>🏆 健康评分排行榜</h3>
-                <div class="ranking-list" id="ranking-list">
-                </div>
-            </div>
-
-            <div class="sidebar-section">
-                <h3>⚠️ 最新告警</h3>
-                <div class="alarm-list" id="alarm-list">
+                <h3>告警统计</h3>
+                <div class="alarm-stats">
+                    <div class="alarm-item critical">
+                        <span class="alarm-count" id="critical-alarm-count">0</span>
+                        <span>二级更换预警</span>
+                    </div>
+                    <div class="alarm-item warning">
+                        <span class="alarm-count" id="warning-alarm-count">0</span>
+                        <span>一级振动告警</span>
+                    </div>
                 </div>
             </div>
         </aside>
 
-        <main class="content">
-            <div class="content-header">
-                <div class="machine-selector">
-                    <label>选择机床:</label>
-                    <select id="machine-select">
-                    </select>
-                </div>
-                <div class="machine-info" id="machine-info">
+        <main class="main-content">
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="overview">总览</button>
+                <button class="tab-btn" data-tab="detail">主轴详情</button>
+                <button class="tab-btn" data-tab="ranking">健康排行</button>
+                <button class="tab-btn" data-tab="stats">故障统计</button>
+            </div>
+
+            <div class="tab-content active" id="tab-overview">
+                <div class="overview-grid">
+                    <div class="card">
+                        <h3>实时健康状态</h3>
+                        <div class="health-summary">
+                            <div class="health-metric">
+                                <div class="metric-value good" id="avg-health-score">--</div>
+                                <div class="metric-label">平均健康评分</div>
+                            </div>
+                            <div class="health-metric">
+                                <div class="metric-value" id="machines-online">--</div>
+                                <div class="metric-label">在线机床</div>
+                            </div>
+                            <div class="health-metric">
+                                <div class="metric-value" id="avg-rul">--</div>
+                                <div class="metric-label">平均RUL(小时)</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h3>主轴剖面图</h3>
+                        <div class="spindle-canvas-container">
+                            <canvas id="spindle-canvas" width="800" height="400"></canvas>
+                        </div>
+                        <div class="sensor-legend">
+                            <span><span class="legend-dot green"></span> 正常 (&lt;2.8mm/s)</span>
+                            <span><span class="legend-dot yellow"></span> 警告 (2.8-7.1mm/s)</span>
+                            <span><span class="legend-dot red"></span> 告警 (&gt;7.1mm/s)</span>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h3>振动频谱瀑布图</h3>
+                        <canvas id="waterfall-canvas" width="800" height="300"></canvas>
+                    </div>
                 </div>
             </div>
 
-            <div class="spindle-section">
-                <div class="section-header">
-                    <h2>🛠️ 主轴剖面图</h2>
-                    <div class="legend">
-                        <span class="legend-item"><span class="dot green"></span> 正常 &lt;2.8mm/s</span>
-                        <span class="legend-item"><span class="dot yellow"></span> 预警 2.8-7.1mm/s</span>
-                        <span class="legend-item"><span class="dot red"></span> 告警 &gt;7.1mm/s</span>
+            <div class="tab-content" id="tab-detail">
+                <div class="detail-container">
+                    <div class="card">
+                        <h3>机床 <span id="detail-machine-id">1</span> 主轴详情</h3>
+                        <div class="detail-info">
+                            <div class="info-item">
+                                <label>健康评分:</label>
+                                <span id="detail-health-score">--</span>
+                            </div>
+                            <div class="info-item">
+                                <label>剩余寿命:</label>
+                                <span id="detail-rul">--</span>
+                            </div>
+                            <div class="info-item">
+                                <label>告警等级:</label>
+                                <span id="detail-alarm-level">--</span>
+                            </div>
+                            <div class="info-item">
+                                <label>运行时间:</label>
+                                <span id="detail-runtime">--</span>
+                            </div>
+                        </div>
                     </div>
-                </div>
-                <div class="spindle-canvas-container">
-                    <canvas id="spindle-canvas" width="800" height="250"></canvas>
-                </div>
-                <div class="sensor-info" id="sensor-info">
-                    <span class="hint">👆 点击传感器圆点查看详细数据</span>
+
+                    <div class="card">
+                        <h3>传感器详情</h3>
+                        <div id="sensor-detail-panel" class="sensor-detail-panel">
+                            <p class="hint">点击主轴剖面图上的传感器查看详情</p>
+                        </div>
+                    </div>
                 </div>
             </div>
 
-            <div class="charts-grid">
-                <div class="chart-card">
-                    <div class="chart-header">
-                        <h3>📈 振动时域波形 (最近1小时)</h3>
-                        <div class="chart-controls">
-                            <select id="waveform-sensor">
-                            </select>
-                        </div>
+            <div class="tab-content" id="tab-ranking">
+                <div class="card">
+                    <h3>40台机床主轴健康评分排行榜</h3>
+                    <div class="ranking-container">
+                        <table class="ranking-table">
+                            <thead>
+                                <tr>
+                                    <th>排名</th>
+                                    <th>机床ID</th>
+                                    <th>健康评分</th>
+                                    <th>剩余寿命(小时)</th>
+                                    <th>告警等级</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ranking-tbody">
+                            </tbody>
+                        </table>
                     </div>
-                    <canvas id="waveform-canvas" width="600" height="200"></canvas>
                 </div>
+            </div>
 
-                <div class="chart-card">
-                    <div class="chart-header">
-                        <h3>📊 振动频谱分析</h3>
-                        <div class="chart-controls">
-                            <select id="spectrum-sensor">
-                            </select>
-                        </div>
+            <div class="tab-content" id="tab-stats">
+                <div class="card">
+                    <h3>本月故障统计</h3>
+                    <div class="stats-charts">
+                        <canvas id="stats-canvas" width="900" height="400"></canvas>
                     </div>
-                    <canvas id="spectrum-canvas" width="600" height="200"></canvas>
-                </div>
-
-                <div class="chart-card full-width">
-                    <div class="chart-header">
-                        <h3>🌊 振动频谱瀑布图</h3>
-                        <div class="chart-controls">
-                            <select id="waterfall-sensor">
-                            </select>
-                            <span class="time-range">时间跨度: 30分钟</span>
-                        </div>
-                    </div>
-                    <canvas id="waterfall-canvas" width="1240" height="250"></canvas>
-                </div>
-
-                <div class="chart-card full-width">
-                    <div class="chart-header">
-                        <h3>📉 RUL历史趋势</h3>
-                    </div>
-                    <canvas id="rul-canvas" width="1240" height="200"></canvas>
                 </div>
             </div>
         </main>
     </div>
 
-    <div class="modal-overlay" id="sensor-modal">
-        <div class="modal">
+    <div id="sensor-modal" class="modal">
+        <div class="modal-content">
             <div class="modal-header">
-                <h3 id="modal-title">传感器详情</h3>
-                <button class="close-btn" onclick="closeSensorModal()">✕</button>
+                <h3>传感器 <span id="modal-sensor-id"></span> 详细数据</h3>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
             </div>
-            <div class="modal-body" id="modal-body">
+            <div class="modal-body">
+                <div class="chart-container">
+                    <h4>近1小时振动时域波形</h4>
+                    <canvas id="waveform-canvas" width="700" height="200"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h4>频谱图</h4>
+                    <canvas id="spectrum-canvas" width="700" height="200"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h4>历史趋势</h4>
+                    <canvas id="trend-canvas" width="700" height="200"></canvas>
+                </div>
             </div>
         </div>
     </div>
 
-    <script src="js/api.js"></script>
-    <script src="js/spindle-canvas.js"></script>
-    <script src="js/charts.js"></script>
-    <script src="js/dashboard.js"></script>
-    <script src="js/main.js"></script>
+    <script src="config.js"></script>
+    <script src="api.js"></script>
+    <script src="spindle-canvas.js"></script>
+    <script src="waterfall-canvas.js"></script>
+    <script src="sensor-charts.js"></script>
+    <script src="ranking.js"></script>
+    <script src="stats.js"></script>
+    <script src="app.js"></script>
 </body>
 </html>

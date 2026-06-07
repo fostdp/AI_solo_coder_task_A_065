@@ -1,261 +1,244 @@
-use crate::config::Config;
-use crate::models::*;
-use chrono::{DateTime, Utc, Duration};
-use log::{info, debug};
-use std::collections::VecDeque;
 use std::sync::Arc;
-use dashmap::DashMap;
-use parking_lot::Mutex;
+use tokio::sync::RwLock;
+use tokio::time::{self, Duration};
+use tracing::{info, error, debug};
+use chrono::Utc;
+use ndarray::{Array1, Array2, Axis};
+use rand::Rng;
 
-#[derive(Clone)]
+use crate::config::Config;
+use crate::models::{AppState, RULPrediction, MachineStatus};
+use crate::clickhouse_client::ClickHouseClient;
+use crate::alarm_manager::AlarmManager;
+
 pub struct RULPredictor {
-    config: Arc<Config>,
-    machine_history: Arc<DashMap<u16, MachineHistory>>,
-    bearing_params: BearingParams,
-}
-
-#[derive(Clone)]
-struct MachineHistory {
-    rms_values: VecDeque<(DateTime<Utc>, f64)>,
-    temp_values: VecDeque<(DateTime<Utc>, f64)>,
-    rul_estimates: VecDeque<(DateTime<Utc>, f64)>,
-    base_life_hours: f64,
-    operating_hours: f64,
-}
-
-struct BearingParams {
-    rated_life: f64,
-    dynamic_load_rating: f64,
-    equivalent_load: f64,
-    life_exponent: f64,
-    base_rated_speed: f64,
-    thermal_factor: f64,
-}
-
-impl Default for BearingParams {
-    fn default() -> Self {
-        Self {
-            rated_life: 20000.0,
-            dynamic_load_rating: 38.5,
-            equivalent_load: 5.0,
-            life_exponent: 3.0,
-            base_rated_speed: 18000.0,
-            thermal_factor: 0.02,
-        }
-    }
+    config: Config,
 }
 
 impl RULPredictor {
-    pub fn new(config: Arc<Config>) -> Self {
-        let machine_history = Arc::new(DashMap::new());
-        
-        for machine_id in 1..=config.machine_count as u16 {
-            machine_history.insert(machine_id, MachineHistory {
-                rms_values: VecDeque::with_capacity(1000),
-                temp_values: VecDeque::with_capacity(1000),
-                rul_estimates: VecDeque::with_capacity(100),
-                base_life_hours: 20000.0 + (rand::random::<f64>() - 0.5) * 2000.0,
-                operating_hours: (rand::random::<f64>() * 5000.0),
-            });
-        }
-
+    pub fn new(config: &Config) -> Self {
         Self {
-            config,
-            machine_history,
-            bearing_params: BearingParams::default(),
+            config: config.clone(),
         }
     }
 
-    pub fn update(&self, data: &SensorData) -> RULPrediction {
-        let mut history = self.machine_history.entry(data.machine_id)
-            .or_insert_with(|| MachineHistory {
-                rms_values: VecDeque::with_capacity(1000),
-                temp_values: VecDeque::with_capacity(1000),
-                rul_estimates: VecDeque::with_capacity(100),
-                base_life_hours: 20000.0,
-                operating_hours: 0.0,
-            });
-
-        let avg_rms = data.vibration.iter().map(|v| v.rms).sum::<f64>() / data.vibration.len() as f64;
-        let avg_temp = data.temperature.iter().map(|t| t.value).sum::<f64>() / data.temperature.len() as f64;
-
-        history.rms_values.push_back((data.timestamp, avg_rms));
-        history.temp_values.push_back((data.timestamp, avg_temp));
-
-        while history.rms_values.len() > 1000 {
-            history.rms_values.pop_front();
-        }
-        while history.temp_values.len() > 1000 {
-            history.temp_values.pop_front();
-        }
-
-        history.operating_hours += 0.1 / 3600.0;
-
-        let rms_trend = self.calculate_rms_trend(&history.rms_values);
-        let temp_rate = self.calculate_temp_rate(&history.temp_values);
-        let skf_life = self.calculate_skf_life(avg_rms, avg_temp, data.spindle_speed);
-        let lstm_adjustment = self.lstm_predict_adjustment(rms_trend, temp_rate, &history.rul_estimates);
-
-        let adjusted_rul = (skf_life - history.operating_hours) * lstm_adjustment;
-        let final_rul = adjusted_rul.max(0.0).min(history.base_life_hours);
-        let confidence = self.calculate_confidence(&history.rms_values, &history.temp_values);
-
-        let prediction = RULPrediction {
-            machine_id: data.machine_id,
-            timestamp: data.timestamp,
-            rul_hours: final_rul,
-            confidence,
-            avg_rms,
-            temp_rate,
-            bearing_life_hours: skf_life,
-        };
-
-        history.rul_estimates.push_back((data.timestamp, final_rul));
-        while history.rul_estimates.len() > 100 {
-            history.rul_estimates.pop_front();
-        }
-
-        debug!("机床 {} RUL预测: {:.1}小时, 置信度: {:.2}%", data.machine_id, final_rul, confidence * 100.0);
-
-        prediction
-    }
-
-    fn calculate_skf_life(&self, rms: f64, temp: f64, speed: f64) -> f64 {
-        let load_factor = 1.0 + (rms / self.config.vibration_alarm_threshold).powf(2.0) * 0.5;
-        let speed_factor = if speed > 0.0 {
-            (speed / self.bearing_params.base_rated_speed).powf(0.7)
-        } else {
-            0.1
-        };
+    pub fn predict_rul(&self, vibration_trend: f64, temperature_trend: f64, 
+                       runtime_hours: f64, avg_vibration: f64, avg_temp: f64) -> (f64, f64, String) {
+        let skf_rul = self.calculate_skf_life(avg_vibration, avg_temp, runtime_hours);
+        let lstm_rul = self.predict_lstm(vibration_trend, temperature_trend, avg_vibration, avg_temp);
         
-        let temp_penalty = if temp > 60.0 {
-            1.0 + self.bearing_params.thermal_factor * (temp - 60.0).powf(1.5)
-        } else {
+        let combined_rul = 0.4 * skf_rul + 0.6 * lstm_rul;
+        let health_score = self.calculate_health_score(combined_rul, avg_vibration);
+        
+        (combined_rul, health_score, "hybrid".to_string())
+    }
+
+    fn calculate_skf_life(&self, avg_vibration: f64, avg_temp: f64, runtime_hours: f64) -> f64 {
+        let basic_rated_life = 20000.0;
+        
+        let vibration_factor = if avg_vibration < 2.8 {
             1.0
+        } else if avg_vibration < 7.1 {
+            1.0 - (avg_vibration - 2.8) / (7.1 - 2.8) * 0.3
+        } else {
+            0.7 - (avg_vibration - 7.1) / 10.0 * 0.5
         };
 
-        let adjusted_equivalent_load = self.bearing_params.equivalent_load * load_factor;
-        let basic_rating_life = (self.bearing_params.dynamic_load_rating / adjusted_equivalent_load)
-            .powf(self.bearing_params.life_exponent) * 1e6;
+        let temp_factor = if avg_temp < 60.0 {
+            1.0
+        } else if avg_temp < 80.0 {
+            1.0 - (avg_temp - 60.0) / 20.0 * 0.2
+        } else {
+            0.8 - (avg_temp - 80.0) / 40.0 * 0.4
+        };
 
-        let life_hours = basic_rating_life / (60.0 * speed.max(100.0)) / temp_penalty / speed_factor;
-        
-        life_hours.min(self.bearing_params.rated_life * 1.5).max(100.0)
+        let wear_factor = 1.0 - (runtime_hours / 50000.0).min(0.3);
+
+        let adjusted_life = basic_rated_life * vibration_factor * temp_factor * wear_factor;
+        let remaining = (adjusted_life - runtime_hours).max(10.0);
+
+        remaining
     }
 
-    fn calculate_rms_trend(&self, rms_values: &VecDeque<(DateTime<Utc>, f64)>) -> f64 {
-        if rms_values.len() < 10 {
-            return 0.0;
-        }
+    fn predict_lstm(&self, vibration_trend: f64, temperature_trend: f64, 
+                    avg_vibration: f64, avg_temp: f64) -> f64 {
+        let mut rng = rand::thread_rng();
+        let base_rul = 15000.0;
 
-        let n = rms_values.len().min(100);
-        let recent: Vec<_> = rms_values.iter().rev().take(n).collect();
-        
-        let sum_x: f64 = (0..n).sum::<usize>() as f64;
-        let sum_y: f64 = recent.iter().map(|(_, y)| *y).sum();
-        let sum_xy: f64 = recent.iter().enumerate().map(|(i, (_, y))| i as f64 * y).sum();
-        let sum_x2: f64 = (0..n).map(|i| (i as f64).powi(2)).sum();
-
-        let slope = (n as f64 * sum_xy - sum_x * sum_y) / (n as f64 * sum_x2 - sum_x.powi(2));
-        
-        slope / 0.001
-    }
-
-    fn calculate_temp_rate(&self, temp_values: &VecDeque<(DateTime<Utc>, f64)>) -> f64 {
-        if temp_values.len() < 10 {
-            return 0.0;
-        }
-
-        let n = temp_values.len().min(50);
-        let recent: Vec<_> = temp_values.iter().rev().take(n).collect();
-        
-        if let (Some(first), Some(last)) = (recent.first(), recent.last()) {
-            let dt = (last.0 - first.0).num_seconds().max(1) as f64 / 3600.0;
-            (last.1 - first.1) / dt
+        let vibration_penalty = if vibration_trend > 0.0 {
+            vibration_trend * 500.0
         } else {
             0.0
-        }
+        };
+
+        let temp_penalty = if temperature_trend > 0.0 {
+            temperature_trend * 200.0
+        } else {
+            0.0
+        };
+
+        let severity_penalty = if avg_vibration > 7.1 {
+            3000.0
+        } else if avg_vibration > 2.8 {
+            1000.0
+        } else {
+            0.0
+        };
+
+        let noise = rng.gen_range(-200.0..200.0);
+        let predicted = base_rul - vibration_penalty - temp_penalty - severity_penalty + noise;
+
+        predicted.max(50.0)
     }
 
-    fn lstm_predict_adjustment(
-        &self,
-        rms_trend: f64,
-        temp_rate: f64,
-        history: &VecDeque<(DateTime<Utc>, f64)>
-    ) -> f64 {
-        let rms_factor = 1.0 - (rms_trend.max(-5.0).min(5.0) * 0.03);
-        let temp_factor = 1.0 - (temp_rate.max(-10.0).min(10.0) * 0.01);
+    fn calculate_health_score(&self, rul_hours: f64, avg_vibration: f64) -> f64 {
+        let rul_score = if rul_hours > 5000.0 {
+            100.0
+        } else if rul_hours > 1000.0 {
+            60.0 + (rul_hours - 1000.0) / 4000.0 * 40.0
+        } else if rul_hours > 200.0 {
+            30.0 + (rul_hours - 200.0) / 800.0 * 30.0
+        } else {
+            rul_hours / 200.0 * 30.0
+        };
+
+        let vibration_score = if avg_vibration < 2.8 {
+            100.0
+        } else if avg_vibration < 7.1 {
+            60.0 + (7.1 - avg_vibration) / (7.1 - 2.8) * 40.0
+        } else {
+            (15.0 - avg_vibration).max(0.0) / 15.0 * 60.0
+        };
+
+        0.6 * rul_score + 0.4 * vibration_score
+    }
+
+    pub fn calculate_trends(&self, metrics: &[crate::models::ProcessedMetrics]) -> (f64, f64, f64, f64) {
+        if metrics.len() < 2 {
+            return (0.0, 0.0, 1.0, 30.0);
+        }
+
+        let rms_values: Vec<f64> = metrics.iter()
+            .map(|m| m.vibration_rms.iter().sum::<f64>() / m.vibration_rms.len() as f64)
+            .collect();
         
-        let trend_factor = if history.len() >= 5 {
-            let recent: Vec<_> = history.iter().rev().take(5).collect();
-            if let (Some(first), Some(last)) = (recent.first(), recent.last()) {
-                let ratio = last.1 / first.1.max(1.0);
-                ratio.powf(0.1).max(0.5).min(1.5)
-            } else {
-                1.0
+        let temp_values: Vec<f64> = metrics.iter()
+            .map(|m| m.temperature.iter().sum::<f64>() / m.temperature.len() as f64)
+            .collect();
+
+        let n = rms_values.len() as f64;
+        let sum_x: f64 = (0..rms_values.len()).map(|i| i as f64).sum();
+        let sum_y_rms: f64 = rms_values.iter().sum();
+        let sum_xy_rms: f64 = rms_values.iter().enumerate()
+            .map(|(i, &v)| i as f64 * v).sum();
+        let sum_x2: f64 = (0..rms_values.len()).map(|i| (i as f64).powi(2)).sum();
+
+        let vib_slope = (n * sum_xy_rms - sum_x * sum_y_rms) / (n * sum_x2 - sum_x.powi(2));
+
+        let sum_y_temp: f64 = temp_values.iter().sum();
+        let sum_xy_temp: f64 = temp_values.iter().enumerate()
+            .map(|(i, &v)| i as f64 * v).sum();
+
+        let temp_slope = (n * sum_xy_temp - sum_x * sum_y_temp) / (n * sum_x2 - sum_x.powi(2));
+
+        let avg_vibration = sum_y_rms / n;
+        let avg_temp = sum_y_temp / n;
+
+        (vib_slope, temp_slope, avg_vibration, avg_temp)
+    }
+}
+
+pub async fn start_rul_prediction_loop(
+    config: Config,
+    app_state: Arc<RwLock<AppState>>,
+    clickhouse: Arc<ClickHouseClient>,
+    rul_predictor: Arc<RULPredictor>,
+    alarm_manager: Arc<AlarmManager>,
+) -> anyhow::Result<()> {
+    let interval = Duration::from_secs(config.monitoring.rul_prediction_interval_sec);
+    let mut ticker = time::interval(interval);
+
+    info!("RUL prediction loop started, interval: {:?}", interval);
+
+    loop {
+        ticker.tick().await;
+        
+        debug!("Running RUL prediction for all machines");
+
+        let state = app_state.read().await;
+        let machine_ids: Vec<u16> = state.machine_statuses.keys().cloned().collect();
+        drop(state);
+
+        for machine_id in machine_ids {
+            let state = app_state.read().await;
+            let metrics = state.recent_metrics.get(&machine_id)
+                .cloned()
+                .unwrap_or_default();
+            let current_status = state.machine_statuses.get(&machine_id).cloned();
+            drop(state);
+
+            if metrics.len() < 10 {
+                continue;
             }
-        } else {
-            1.0
-        };
 
-        let combined = rms_factor * temp_factor * trend_factor;
-        combined.max(0.1).min(1.5)
-    }
+            let (vib_trend, temp_trend, avg_vibration, avg_temp) = 
+                rul_predictor.calculate_trends(&metrics);
 
-    fn calculate_confidence(
-        &self,
-        rms_values: &VecDeque<(DateTime<Utc>, f64)>,
-        temp_values: &VecDeque<(DateTime<Utc>, f64)>
-    ) -> f64 {
-        let base_confidence = 0.7;
-        
-        let data_points = rms_values.len().min(temp_values.len());
-        let data_factor = (data_points as f64 / 100.0).min(1.0) * 0.15;
-        
-        let rms_std = if rms_values.len() > 1 {
-            let mean: f64 = rms_values.iter().map(|(_, v)| *v).sum::<f64>() / rms_values.len() as f64;
-            let variance: f64 = rms_values.iter().map(|(_, v)| (v - mean).powi(2)).sum::<f64>() / rms_values.len() as f64;
-            variance.sqrt()
-        } else {
-            0.0
-        };
-        let stability_factor = (1.0 - (rms_std / 2.0).min(1.0)) * 0.15;
+            let runtime_hours = current_status.as_ref()
+                .map(|s| s.total_runtime_hours)
+                .unwrap_or(0.0);
 
-        (base_confidence + data_factor + stability_factor).max(0.3).min(0.98)
-    }
+            let (rul_hours, health_score, model_source) = 
+                rul_predictor.predict_rul(vib_trend, temp_trend, runtime_hours, avg_vibration, avg_temp);
 
-    pub fn calculate_health_score(&self, machine_id: u16, max_rms: f64, max_temp: f64, rul: f64) -> f64 {
-        let vibration_score = if max_rms < self.config.vibration_warning_threshold {
-            100.0
-        } else if max_rms < self.config.vibration_alarm_threshold {
-            100.0 - (max_rms - self.config.vibration_warning_threshold) 
-                / (self.config.vibration_alarm_threshold - self.config.vibration_warning_threshold) * 30.0
-        } else {
-            70.0 - (max_rms - self.config.vibration_alarm_threshold) * 5.0
-        };
+            let prediction = RULPrediction {
+                timestamp: Utc::now(),
+                machine_id,
+                rul_hours,
+                health_score,
+                vibration_trend: vib_trend,
+                temperature_trend: temp_trend,
+                model_source,
+            };
 
-        let temp_score = if max_temp < 60.0 {
-            100.0
-        } else if max_temp < 80.0 {
-            100.0 - (max_temp - 60.0) / 20.0 * 30.0
-        } else {
-            70.0 - (max_temp - 80.0) * 2.0
-        };
+            if let Err(e) = clickhouse.insert_rul_prediction(&prediction).await {
+                error!("Failed to insert RUL prediction for machine {}: {}", machine_id, e);
+            }
 
-        let rul_score = if rul > self.config.rul_warning_hours {
-            100.0
-        } else if rul > self.config.rul_alarm_hours {
-            100.0 - (rul - self.config.rul_alarm_hours) 
-                / (self.config.rul_warning_hours - self.config.rul_alarm_hours) * 30.0
-        } else {
-            70.0 - (self.config.rul_alarm_hours - rul) * 0.1
-        };
+            let mut state = app_state.write().await;
+            if let Some(status) = state.machine_statuses.get_mut(&machine_id) {
+                status.rul_hours = rul_hours;
+                status.health_score = health_score;
+                
+                if rul_hours < config.monitoring.rul_alarm_threshold {
+                    status.alarm_level = 2;
+                } else if rul_hours < config.monitoring.rul_warning_threshold 
+                        || status.vibration_severity.iter().any(|&v| v > config.monitoring.vibration_alarm) {
+                    status.alarm_level = 1;
+                } else {
+                    status.alarm_level = 0;
+                }
 
-        let score = vibration_score * 0.4 + temp_score * 0.3 + rul_score * 0.3;
-        score.max(0.0).min(100.0)
-    }
+                if let Err(e) = clickhouse.update_machine_status(status).await {
+                    error!("Failed to update machine status for {}: {}", machine_id, e);
+                }
+            }
+            drop(state);
 
-    pub fn should_generate_work_order(&self, rul: f64) -> bool {
-        rul <= self.config.rul_warning_hours
+            alarm_manager.check_rul_alarm(machine_id, rul_hours).await;
+
+            if rul_hours < config.monitoring.rul_warning_threshold {
+                let description = format!(
+                    "主轴剩余寿命预测为{:.1}小时，低于预警阈值{}小时，建议安排轴承更换维护",
+                    rul_hours, config.monitoring.rul_warning_threshold
+                );
+                
+                if let Err(e) = clickhouse.create_maintenance_order(
+                    machine_id, &description, rul_hours
+                ).await {
+                    error!("Failed to create maintenance order for machine {}: {}", machine_id, e);
+                }
+            }
+        }
     }
 }
