@@ -2,11 +2,14 @@ const App = {
     currentMachineId: 1,
     machineStatuses: {},
     mockMode: true,
+    spindleProfile: null,
+    waterfallPlot: null,
+    selectedSensorIndex: 0,
 
     init() {
         this.setupTabs();
         this.setupMachineList();
-        this.initCanvases();
+        this.initComponents();
         this.setupSensorListener();
         this.startTimeUpdater();
         this.loadInitialData();
@@ -58,7 +61,6 @@ const App = {
 
     selectMachine(machineId) {
         this.currentMachineId = machineId;
-        SpindleCanvas.currentMachineId = machineId;
         
         document.querySelectorAll('.machine-item').forEach(item => {
             item.classList.remove('active');
@@ -71,16 +73,47 @@ const App = {
         this.updateMachineDetail(machineId);
         
         const status = this.machineStatuses[machineId];
-        if (status) {
-            SpindleCanvas.updateData(status.vibration_severity || []);
+        if (status && this.spindleProfile) {
+            const spindleData = this.buildSpindleData(status);
+            this.spindleProfile.update(spindleData);
         }
     },
 
-    initCanvases() {
-        SpindleCanvas.init();
-        WaterfallCanvas.init();
+    initComponents() {
+        this.spindleProfile = new SpindleProfile('spindle-canvas');
+        this.spindleProfile.onSensorSelect = (index) => {
+            this.selectedSensorIndex = index;
+            if (this.waterfallPlot) {
+                this.waterfallPlot.setSensorIndex(index);
+            }
+        };
+        
+        this.waterfallPlot = new WaterfallPlot('waterfall-canvas', {
+            maxHistory: 60,
+            maxFrequency: 500,
+            frequencyBins: 128,
+            sensorIndex: 0
+        });
+        
         SensorCharts.init();
         Stats.init();
+    },
+
+    buildSpindleData(status) {
+        const sensorReadings = [];
+        for (let i = 0; i < 8; i++) {
+            sensorReadings.push({
+                rms: (status.vibration_severity && status.vibration_severity[i]) || 0,
+                type: i < 4 ? 'vibration' : 'temperature'
+            });
+        }
+        for (let i = 0; i < 2; i++) {
+            sensorReadings.push({
+                value: (status.avg_temperature && status.avg_temperature[i]) || 0,
+                type: 'displacement'
+            });
+        }
+        return { sensorReadings, machineId: status.machine_id };
     },
 
     setupSensorListener() {
@@ -195,10 +228,10 @@ const App = {
                 });
                 this.updateOverview();
                 
-                if (this.machineStatuses[this.currentMachineId]) {
-                    SpindleCanvas.updateData(
-                        this.machineStatuses[this.currentMachineId].vibration_severity || []
-                    );
+                const status = this.machineStatuses[this.currentMachineId];
+                if (status && this.spindleProfile) {
+                    const spindleData = this.buildSpindleData(status);
+                    this.spindleProfile.update(spindleData);
                     this.updateMachineDetail(this.currentMachineId);
                 }
             }
@@ -212,12 +245,14 @@ const App = {
             }
             
             const status = this.machineStatuses[this.currentMachineId];
-            if (status) {
+            if (status && this.waterfallPlot) {
                 const mockSpectrum = [];
-                for (let i = 0; i < 64; i++) {
-                    mockSpectrum.push(Math.random() * 4 + 0.5);
+                for (let i = 0; i < 128; i++) {
+                    const base = Math.exp(-i / 40) * 3;
+                    const noise = Math.random() * 1.5;
+                    mockSpectrum.push(base + noise + 0.3);
                 }
-                WaterfallCanvas.addSpectrum(mockSpectrum);
+                this.waterfallPlot.update(mockSpectrum, this.selectedSensorIndex);
             }
         }, 2000);
     },
@@ -235,8 +270,9 @@ const App = {
         this.updateOverview();
         
         const status = this.machineStatuses[this.currentMachineId];
-        if (status) {
-            SpindleCanvas.updateData(status.vibration_severity || []);
+        if (status && this.spindleProfile) {
+            const spindleData = this.buildSpindleData(status);
+            this.spindleProfile.update(spindleData);
         }
     }
 };

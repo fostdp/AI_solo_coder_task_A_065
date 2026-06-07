@@ -8,6 +8,7 @@ pub struct Config {
     pub mqtt: MqttConfig,
     pub monitoring: MonitoringConfig,
     pub machines: MachinesConfig,
+    pub models: ModelsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +52,49 @@ pub struct MachinesConfig {
     pub sensors_vibration: u8,
     pub sensors_temperature: u8,
     pub sensors_displacement: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelsConfig {
+    pub skf: SkfModelConfig,
+    pub lstm: LstmModelConfig,
+    pub hybrid: HybridModelConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkfModelConfig {
+    pub basic_rated_life_hours: f64,
+    pub vibration_factor_low_vib_low: f64,
+    pub vib_factor_medium_low: f64,
+    pub vib_factor_high: f64,
+    pub temp_factor_low: f64,
+    pub temp_factor_medium: f64,
+    pub temp_factor_high: f64,
+    pub load_factor_coefficient: f64,
+    pub max_wear_factor: f64,
+    pub wear_rate_per_50k_hours: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LstmModelConfig {
+    pub base_rul_hours: f64,
+    pub vib_high_penalty_per_std: f64,
+    pub vib_low_penalty_per_std: f64,
+    pub temp_penalty_per_std: f64,
+    pub temp_rate_penalty_per_deg_s: f64,
+    pub load_penalty_coefficient: f64,
+    pub high_rpm_threshold: f64,
+    pub high_rpm_penalty: f64,
+    pub noise_std_dev: f64,
+    pub smoothing_factor: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HybridModelConfig {
+    pub weights_low_speed: [f64; 3],
+    pub weights_medium_speed: [f64; 3],
+    pub weights_high_speed: [f64; 3],
+    pub weights_unknown: [f64; 3],
 }
 
 impl Config {

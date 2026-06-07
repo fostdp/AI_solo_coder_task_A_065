@@ -30,3 +30,33 @@ count = 40
 sensors_vibration = 8
 sensors_temperature = 4
 sensors_displacement = 2
+
+[models.skf]
+basic_rated_life_hours = 25000.0
+vibration_factor_low_vib_low = 2.0
+vib_factor_medium_low = 5.0
+vib_factor_high = 8.0
+temp_factor_low = 50.0
+temp_factor_medium = 70.0
+temp_factor_high = 90.0
+load_factor_coefficient = 0.15
+max_wear_factor = 0.35
+wear_rate_per_50k_hours = 50000.0
+
+[models.lstm]
+base_rul_hours = 18000.0
+vib_high_penalty_per_std = 800.0
+vib_low_penalty_per_std = 200.0
+temp_penalty_per_std = 500.0
+temp_rate_penalty_per_deg_s = 2000.0
+load_penalty_coefficient = 1500.0
+high_rpm_threshold = 0.7
+high_rpm_penalty = 1000.0
+noise_std_dev = 100.0
+smoothing_factor = 0.3
+
+[models.hybrid]
+weights_low_speed = [0.35, 0.35, 0.30]
+weights_medium_speed = [0.40, 0.35, 0.25]
+weights_high_speed = [0.45, 0.35, 0.20]
+weights_unknown = [0.40, 0.35, 0.25]

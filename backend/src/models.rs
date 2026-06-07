@@ -69,6 +69,54 @@ pub struct ConditionFeatures {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeDomainFeatures {
+    pub rms: Vec<f64>,
+    pub peak: Vec<f64>,
+    pub crest_factor: f64,
+    pub skewness: f64,
+    pub kurtosis: f64,
+    pub std_dev: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrequencyDomainFeatures {
+    pub spectrum: Vec<Vec<f64>>,
+    pub dominant_frequencies: Vec<f64>,
+    pub spectral_centroid: Vec<f64>,
+    pub spectral_energy: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzedMetrics {
+    pub timestamp: DateTime<Utc>,
+    pub machine_id: u16,
+    pub spindle_id: u8,
+    pub vibration: Vec<f64>,
+    pub temperature: Vec<f64>,
+    pub displacement: Vec<f64>,
+    pub rpm: f64,
+    pub time_domain: TimeDomainFeatures,
+    pub frequency_domain: FrequencyDomainFeatures,
+    pub vibration_severity: Vec<f64>,
+    pub condition: OperatingCondition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RULPredictionResult {
+    pub timestamp: DateTime<Utc>,
+    pub machine_id: u16,
+    pub rul_hours: f64,
+    pub health_score: f64,
+    pub vibration_trend: f64,
+    pub temperature_trend: f64,
+    pub model_source: String,
+    pub condition: OperatingCondition,
+    pub skf_component: f64,
+    pub lstm_component: f64,
+    pub trend_component: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorData {
     pub timestamp: i64,
     pub machine_id: u16,
