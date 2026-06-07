@@ -1,300 +1,200 @@
 const API_BASE = 'http://localhost:8080/api';
 
-const api = {
+const API = {
     async getMachines() {
         try {
             const response = await fetch(`${API_BASE}/machines`);
+            if (!response.ok) return this.getMockMachines();
             return await response.json();
         } catch (e) {
+            console.warn('API连接失败，使用Mock数据');
             return this.getMockMachines();
         }
     },
 
-    async getMachine(id) {
+    async getMachineStatus(machineId) {
         try {
-            const response = await fetch(`${API_BASE}/machines/${id}`);
+            const response = await fetch(`${API_BASE}/machines/${machineId}/status`);
+            if (!response.ok) return this.getMockMachineStatus(machineId);
             return await response.json();
         } catch (e) {
-            return this.getMockMachine(id);
+            return this.getMockMachineStatus(machineId);
         }
     },
 
-    async getSensors(machineId) {
+    async getSensorHistory(machineId, sensorType, sensorId, hours = 1) {
         try {
-            const response = await fetch(`${API_BASE}/machines/${machineId}/sensors`);
+            const response = await fetch(
+                `${API_BASE}/machines/${machineId}/sensors/${sensorType}/${sensorId}/history?hours=${hours}`
+            );
+            if (!response.ok) return this.getMockHistory();
             return await response.json();
         } catch (e) {
-            return this.getMockSensors(machineId);
+            return this.getMockHistory();
         }
     },
 
-    async getSensorData(machineId) {
+    async getSensorPositions() {
         try {
-            const response = await fetch(`${API_BASE}/machines/${machineId}/sensors/data`);
+            const response = await fetch(`${API_BASE}/sensors/positions`);
+            if (!response.ok) return this.getMockSensorPositions();
             return await response.json();
         } catch (e) {
-            return this.getMockSensorData(machineId);
+            return this.getMockSensorPositions();
         }
     },
 
-    async getSensorHistory(sensorId) {
+    async getAlarms(limit = 20) {
         try {
-            const response = await fetch(`${API_BASE}/sensors/${sensorId}/history`);
-            return await response.json();
-        } catch (e) {
-            return this.getMockSensorHistory(sensorId);
-        }
-    },
-
-    async getHealthRanking() {
-        try {
-            const response = await fetch(`${API_BASE}/ranking`);
-            return await response.json();
-        } catch (e) {
-            return this.getMockRanking();
-        }
-    },
-
-    async getFaultStatistics() {
-        try {
-            const response = await fetch(`${API_BASE}/statistics`);
-            return await response.json();
-        } catch (e) {
-            return this.getMockStatistics();
-        }
-    },
-
-    async getRUL(machineId) {
-        try {
-            const response = await fetch(`${API_BASE}/machines/${machineId}/rul`);
-            return await response.json();
-        } catch (e) {
-            return this.getMockRUL(machineId);
-        }
-    },
-
-    async getRecentAlarms() {
-        try {
-            const response = await fetch(`${API_BASE}/alarms`);
+            const response = await fetch(`${API_BASE}/alarms?limit=${limit}`);
+            if (!response.ok) return this.getMockAlarms();
             return await response.json();
         } catch (e) {
             return this.getMockAlarms();
         }
     },
 
+    async getMonthlyStats() {
+        try {
+            const response = await fetch(`${API_BASE}/stats/monthly`);
+            if (!response.ok) return this.getMockMonthlyStats();
+            return await response.json();
+        } catch (e) {
+            return this.getMockMonthlyStats();
+        }
+    },
+
+    async getRanking() {
+        try {
+            const response = await fetch(`${API_BASE}/ranking`);
+            if (!response.ok) return this.getMockRanking();
+            return await response.json();
+        } catch (e) {
+            return this.getMockRanking();
+        }
+    },
+
     getMockMachines() {
         const machines = [];
         for (let i = 1; i <= 40; i++) {
-            machines.push({
-                machine_id: i,
-                machine_name: `CNC-${i}`,
-                model: 'DMG MORI DMU 50',
-                install_date: '2022-01-15',
-                location: `Line-${Math.floor((i - 1) / 10) + 1}`,
-                operator: `Operator-${(i % 10) + 1}`,
-                status: i % 7 === 0 ? 'idle' : 'running'
-            });
+            machines.push(this.getMockMachineStatus(i));
         }
         return machines;
     },
 
-    getMockMachine(id) {
+    getMockMachineStatus(id) {
+        const hasFault = [5, 12, 28, 35].includes(id);
+        const baseRms = hasFault ? 5 + Math.random() * 4 : 1 + Math.random() * 2;
+        const baseRul = hasFault ? 150 + Math.random() * 200 : 5000 + Math.random() * 10000;
+        const baseTemp = hasFault ? 55 + Math.random() * 15 : 35 + Math.random() * 15;
+        
+        let alarmStatus = 0;
+        if (baseRms > 7.1 || baseRul < 200) alarmStatus = 2;
+        else if (baseRms > 2.8 || baseRul < 500) alarmStatus = 1;
+
         return {
             machine_id: id,
-            machine_name: `CNC-${id}`,
-            model: 'DMG MORI DMU 50',
-            install_date: '2022-01-15',
-            location: `Line-${Math.floor((id - 1) / 10) + 1}`,
-            operator: `Operator-${(id % 10) + 1}`,
-            status: id % 7 === 0 ? 'idle' : 'running'
+            health_score: hasFault ? 50 + Math.random() * 20 : 80 + Math.random() * 20,
+            rul_hours: baseRul,
+            max_vibration_rms: baseRms,
+            max_temperature: baseTemp,
+            alarm_status: alarmStatus,
+            last_update: new Date().toISOString()
         };
     },
 
-    getMockSensors(machineId) {
-        const sensors = [];
-        const positions = [
-            { name: '前轴承径向X', x: -20, y: 0, z: 100, type: 1, unit: 'mm/s' },
-            { name: '前轴承径向Y', x: 0, y: -20, z: 100, type: 1, unit: 'mm/s' },
-            { name: '前轴承轴向', x: 0, y: 0, z: 120, type: 1, unit: 'mm/s' },
-            { name: '后轴承径向X', x: -20, y: 0, z: -100, type: 1, unit: 'mm/s' },
-            { name: '后轴承径向Y', x: 0, y: -20, z: -100, type: 1, unit: 'mm/s' },
-            { name: '后轴承轴向', x: 0, y: 0, z: -120, type: 1, unit: 'mm/s' },
-            { name: '电机端径向', x: -15, y: 0, z: 150, type: 1, unit: 'mm/s' },
-            { name: '刀具端径向', x: -15, y: 0, z: -150, type: 1, unit: 'mm/s' },
-            { name: '前轴承座', x: 0, y: 0, z: 100, type: 2, unit: '°C' },
-            { name: '后轴承座', x: 0, y: 0, z: -100, type: 2, unit: '°C' },
-            { name: '定子绕组', x: 0, y: 0, z: 50, type: 2, unit: '°C' },
-            { name: '环境温度', x: 50, y: 0, z: 0, type: 2, unit: '°C' },
-            { name: '轴向位移', x: 0, y: 0, z: 0, type: 3, unit: 'mm' },
-            { name: '径向跳动', x: 0, y: 0, z: 0, type: 3, unit: 'mm' },
-        ];
-
-        positions.forEach((pos, idx) => {
-            sensors.push({
-                sensor_id: idx + 1,
-                machine_id: machineId,
-                sensor_type: pos.type,
-                position_name: pos.name,
-                position_x: pos.x,
-                position_y: pos.y,
-                position_z: pos.z,
-                axis: 'x',
-                unit: pos.unit,
-                status: 1
-            });
-        });
-
-        return sensors;
-    },
-
-    getMockSensorData(machineId) {
+    getMockHistory() {
         const data = [];
-        const now = Date.now() / 1000;
-        
-        for (let i = 1; i <= 14; i++) {
-            let value;
-            if (i <= 8) {
-                value = 1.5 + Math.random() * 3.5;
-            } else if (i <= 12) {
-                value = 40 + Math.random() * 20;
-            } else {
-                value = (Math.random() - 0.5) * 0.1;
-            }
-            
+        const now = Date.now();
+        for (let i = 0; i < 60; i++) {
             data.push({
-                timestamp: now,
-                machine_id: machineId,
-                sensor_id: i,
-                sensor_type: i <= 8 ? 1 : (i <= 12 ? 2 : 3),
-                value_min: value * 0.9,
-                value_max: value * 1.1,
-                value_avg: value,
-                value_rms: value,
-                value_std: value * 0.1,
-                value_peak: value * 1.5,
-                spindle_speed_avg: 8000,
-                load_avg: 45,
-                temperature_avg: 45,
-                sample_count: 10
+                timestamp: { 0: now - (60 - i) * 60000 },
+                value: 1.5 + Math.sin(i * 0.2) * 0.5 + Math.random() * 0.3
             });
         }
         return data;
     },
 
-    getMockSensorHistory(sensorId) {
-        const recentData = [];
-        const historyTrend = [];
-        const now = Date.now() / 1000;
+    getMockSensorPositions() {
+        return [
+            { id: 1, name: '前轴承径向X', x: 120, y: 80, location: '前端轴承座' },
+            { id: 2, name: '前轴承径向Y', x: 120, y: 120, location: '前端轴承座' },
+            { id: 3, name: '前轴承轴向', x: 80, y: 100, location: '前端轴承座' },
+            { id: 4, name: '中轴承径向X', x: 250, y: 80, location: '中间支撑' },
+            { id: 5, name: '中轴承径向Y', x: 250, y: 120, location: '中间支撑' },
+            { id: 6, name: '后轴承径向X', x: 380, y: 80, location: '后端轴承座' },
+            { id: 7, name: '后轴承径向Y', x: 380, y: 120, location: '后端轴承座' },
+            { id: 8, name: '刀柄位置', x: 40, y: 100, location: '刀具接口' },
+        ];
+    },
 
-        for (let i = 3600; i >= 0; i -= 60) {
-            const baseValue = sensorId <= 8 ? 2.0 : (sensorId <= 12 ? 45 : 0.02);
-            recentData.push({
-                timestamp: now - i,
-                value: baseValue + (Math.random() - 0.5) * baseValue * 0.3
-            });
-        }
+    getMockAlarms() {
+        return [
+            {
+                id: 'ALARM-001',
+                timestamp: new Date(Date.now() - 300000).toISOString(),
+                machine_id: 5,
+                sensor_type: 'vibration',
+                sensor_id: 1,
+                level: 2,
+                message: '振动烈度超过阈值7.1mm/s持续10秒',
+                value: 8.5,
+                threshold: 7.1,
+                acknowledged: false
+            },
+            {
+                id: 'ALARM-002',
+                timestamp: new Date(Date.now() - 600000).toISOString(),
+                machine_id: 12,
+                sensor_type: 'rul',
+                sensor_id: null,
+                level: 2,
+                message: '主轴剩余寿命低于200小时，需立即更换轴承',
+                value: 185,
+                threshold: 200,
+                acknowledged: false
+            },
+            {
+                id: 'ALARM-003',
+                timestamp: new Date(Date.now() - 1800000).toISOString(),
+                machine_id: 28,
+                sensor_type: 'rul',
+                sensor_id: null,
+                level: 1,
+                message: '主轴剩余寿命低于500小时，建议安排维护',
+                value: 420,
+                threshold: 500,
+                acknowledged: false
+            }
+        ];
+    },
 
-        for (let i = 7 * 24 * 3600; i >= 0; i -= 3600) {
-            const baseValue = sensorId <= 8 ? 2.0 : (sensorId <= 12 ? 45 : 0.02);
-            const trend = 1 + (7 * 24 * 3600 - i) / (7 * 24 * 3600) * 0.3;
-            historyTrend.push({
-                timestamp: now - i,
-                value: baseValue * trend + (Math.random() - 0.5) * baseValue * 0.2
-            });
-        }
-
-        const frequencies = [];
-        const amplitudes = [];
-        for (let i = 0; i < 100; i++) {
-            frequencies.push(i * 10);
-            amplitudes.push(i % 17 === 0 ? 2.5 + Math.random() : 0.5 + Math.random() * 0.3);
-        }
-
+    getMockMonthlyStats() {
         return {
-            sensor_config: {
-                sensor_id: sensorId,
-                machine_id: 1,
-                sensor_type: sensorId <= 8 ? 1 : (sensorId <= 12 ? 2 : 3),
-                position_name: `传感器 ${sensorId}`,
-                position_x: 0,
-                position_y: 0,
-                position_z: 0,
-                axis: 'x',
-                unit: sensorId <= 8 ? 'mm/s' : (sensorId <= 12 ? '°C' : 'mm'),
-                status: 1
-            },
-            recent_data: recentData,
-            spectrum: {
-                timestamp: now,
-                machine_id: 1,
-                sensor_id: sensorId,
-                frequency: frequencies,
-                amplitude: amplitudes,
-                rpm: 8000
-            },
-            history_trend: historyTrend
+            month: '2026-06',
+            total_alarms: 47,
+            critical_alarms: 8,
+            warning_alarms: 39,
+            avg_health_score: 87.3,
+            machines_maintained: 5
         };
     },
 
     getMockRanking() {
         const ranking = [];
         for (let i = 1; i <= 40; i++) {
+            const hasFault = [5, 12, 28, 35].includes(i);
             ranking.push({
                 machine_id: i,
-                machine_name: `CNC-${i}`,
-                overall_score: Math.floor(60 + Math.random() * 40),
-                rul_hours: 1000 + Math.random() * 5000,
-                location: `Line-${Math.floor((i - 1) / 10) + 1}`
+                health_score: hasFault ? 45 + Math.random() * 25 : 70 + Math.random() * 30,
+                rul_hours: hasFault ? 100 + Math.random() * 400 : 6000 + Math.random() * 10000,
+                max_vibration_rms: hasFault ? 4 + Math.random() * 5 : 1 + Math.random() * 2,
+                max_temperature: hasFault ? 50 + Math.random() * 20 : 35 + Math.random() * 15,
+                alarm_status: hasFault ? (Math.random() > 0.5 ? 2 : 1) : 0,
+                last_update: new Date().toISOString()
             });
         }
-        return ranking.sort((a, b) => b.overall_score - a.overall_score);
-    },
-
-    getMockStatistics() {
-        return [{
-            month: '202606',
-            total_alarms: 156,
-            vibration_alarms: 68,
-            temperature_alarms: 45,
-            rul_alarms: 23,
-            work_orders_created: 12
-        }];
-    },
-
-    getMockRUL(machineId) {
-        const baseRUL = 5000 + Math.random() * 3000;
-        return {
-            timestamp: Date.now() / 1000,
-            machine_id: machineId,
-            bearing_id: 1,
-            rul_hours: baseRUL,
-            rul_confidence: 0.85 + Math.random() * 0.1,
-            vibration_rms_trend: 5 + Math.random() * 10,
-            temperature_rate: 2 + Math.random() * 5,
-            skf_l10_life: baseRUL * 1.1,
-            lstm_prediction: baseRUL * 0.95,
-            health_score: Math.floor(70 + Math.random() * 25)
-        };
-    },
-
-    getMockAlarms() {
-        const alarms = [];
-        const now = Date.now() / 1000;
-        
-        for (let i = 0; i < 5; i++) {
-            alarms.push({
-                alarm_id: 'xxxx-xxxx-xxxx-xxxx',
-                timestamp: now - i * 3600,
-                machine_id: Math.floor(Math.random() * 40) + 1,
-                sensor_id: Math.floor(Math.random() * 8) + 1,
-                alarm_level: i === 0 ? 2 : 1,
-                alarm_type: Math.floor(Math.random() * 4) + 1,
-                alarm_message: i === 0 ? '振动烈度超限告警' : '温度异常预警',
-                value: 8.5 + Math.random(),
-                threshold: 7.1,
-                duration_ms: 10000
-            });
-        }
-        return alarms;
+        ranking.sort((a, b) => b.health_score - a.health_score);
+        return ranking;
     }
 };

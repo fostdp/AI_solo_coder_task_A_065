@@ -9,236 +9,207 @@ import socket
 import struct
 import time
 import random
+import threading
 import math
-import argparse
+from typing import List, Dict
+from dataclasses import dataclass
 from datetime import datetime
 
-# 配置
-DEFAULT_UDP_HOST = "127.0.0.1"
-DEFAULT_UDP_PORT = 9999
-NUM_MACHINES = 40
-SENSORS_PER_MACHINE = 14  # 8振动 + 4温度 + 2位移
-INTERVAL_MS = 100  # 每100ms上报一次
+UDP_HOST = "127.0.0.1"
+UDP_PORT = 9876
+MACHINE_COUNT = 40
+SAMPLE_INTERVAL = 0.1  # 100ms
 
-# 传感器类型定义
-SENSOR_TYPE_VIBRATION = 1
-SENSOR_TYPE_TEMPERATURE = 2
-SENSOR_TYPE_DISPLACEMENT = 3
+ECAT_MAGIC = 0xECAT
 
-# 传感器配置 (位置名称, 类型, 基准值, 波动范围)
-SENSOR_CONFIG = [
-    # 8个振动传感器
-    ("前轴承径向X", SENSOR_TYPE_VIBRATION, 1.2, 0.8),
-    ("前轴承径向Y", SENSOR_TYPE_VIBRATION, 1.0, 0.7),
-    ("前轴承轴向", SENSOR_TYPE_VIBRATION, 0.8, 0.6),
-    ("后轴承径向X", SENSOR_TYPE_VIBRATION, 1.5, 0.9),
-    ("后轴承径向Y", SENSOR_TYPE_VIBRATION, 1.3, 0.8),
-    ("后轴承轴向", SENSOR_TYPE_VIBRATION, 0.9, 0.5),
-    ("电机端径向", SENSOR_TYPE_VIBRATION, 1.8, 1.0),
-    ("刀具端径向", SENSOR_TYPE_VIBRATION, 2.0, 1.2),
-    # 4个温度传感器
-    ("前轴承座", SENSOR_TYPE_TEMPERATURE, 45.0, 5.0),
-    ("后轴承座", SENSOR_TYPE_TEMPERATURE, 42.0, 4.0),
-    ("定子绕组", SENSOR_TYPE_TEMPERATURE, 55.0, 8.0),
-    ("环境温度", SENSOR_TYPE_TEMPERATURE, 25.0, 3.0),
-    # 2个位移传感器
-    ("轴向位移", SENSOR_TYPE_DISPLACEMENT, 0.02, 0.01),
-    ("径向跳动", SENSOR_TYPE_DISPLACEMENT, 0.05, 0.02),
-]
+@dataclass
+class VibrationSensor:
+    base_rms: float
+    noise_level: float
+    fault_factor: float = 1.0
+
+@dataclass
+class TemperatureSensor:
+    base_temp: float
+    noise_level: float
+    rising_rate: float = 0.0
+
+@dataclass
+class MachineState:
+    machine_id: int
+    is_running: bool
+    spindle_speed: float
+    base_speed: float
+    vibration_sensors: List[VibrationSensor]
+    temp_sensors: List[TemperatureSensor]
+    health_degradation: float = 0.0
+    runtime_hours: float = 0.0
 
 
-class EtherCATSimulator:
-    def __init__(self, host=DEFAULT_UDP_HOST, port=DEFAULT_UDP_PORT, 
-                 num_machines=NUM_MACHINES, anomaly_mode=False):
-        self.host = host
-        self.port = port
-        self.num_machines = num_machines
-        self.anomaly_mode = anomaly_mode
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.machine_states = {}
-        self.anomaly_machines = set()
-        
-        # 初始化机床状态
-        for i in range(1, num_machines + 1):
-            self.machine_states[i] = {
-                "spindle_speed": 8000.0,
-                "load": 40.0,
-                "degradation": 0.0,  # 退化程度 0-1
-                "anomaly_vibration": False,
-                "anomaly_temperature": False,
-            }
-        
-        # 异常模式下，随机选择几台机床模拟故障
-        if anomaly_mode:
-            num_anomaly = min(5, num_machines // 8)
-            self.anomaly_machines = set(random.sample(range(1, num_machines + 1), num_anomaly))
-            print(f"异常模式: 机床 {self.anomaly_machines} 将模拟故障状态")
+def create_machine(machine_id: int) -> MachineState:
+    base_speed = 8000 + random.uniform(-1000, 2000)
+    
+    vibration_sensors = []
+    for i in range(8):
+        base_rms = 1.0 + random.uniform(0, 1.5)
+        if i in [0, 1, 5, 6]:
+            base_rms *= 1.3
+        vibration_sensors.append(VibrationSensor(
+            base_rms=base_rms,
+            noise_level=0.2 + random.uniform(0, 0.3),
+        ))
+    
+    temp_sensors = []
+    base_temp = 35.0 + random.uniform(0, 10)
+    for i in range(4):
+        temp_sensors.append(TemperatureSensor(
+            base_temp=base_temp + i * 3.0,
+            noise_level=0.3,
+            rising_rate=0.001 + random.uniform(0, 0.002),
+        ))
+    
+    if machine_id in [5, 12, 28, 35]:
+        vibration_sensors[0].fault_factor = 2.5
+        vibration_sensors[1].fault_factor = 2.0
+        vibration_sensors[5].fault_factor = 1.8
+        temp_sensors[0].base_temp += 15.0
+    
+    return MachineState(
+        machine_id=machine_id,
+        is_running=True,
+        spindle_speed=base_speed,
+        base_speed=base_speed,
+        vibration_sensors=vibration_sensors,
+        temp_sensors=temp_sensors,
+        health_degradation=random.uniform(0, 0.3),
+        runtime_hours=random.uniform(1000, 5000),
+    )
 
-    def generate_sensor_value(self, machine_id, sensor_idx, timestamp):
-        """生成单个传感器的模拟数据"""
-        config = SENSOR_CONFIG[sensor_idx]
-        name, sensor_type, base_value, range_value = config
-        state = self.machine_states[machine_id]
-        
-        # 基础波动
-        noise = random.gauss(0, range_value * 0.3)
-        value = base_value + noise
-        
-        # 添加周期性波动（模拟主轴旋转）
-        if sensor_type == SENSOR_TYPE_VIBRATION:
-            freq = state["spindle_speed"] / 60.0  # Hz
-            phase = (timestamp * freq * 2 * math.pi) % (2 * math.pi)
-            value += math.sin(phase) * range_value * 0.5
-            
-            # 高次谐波
-            for harmonic in [2, 3, 5]:
-                value += math.sin(phase * harmonic) * range_value * 0.15
-        
-        # 温度随负载变化
-        if sensor_type == SENSOR_TYPE_TEMPERATURE:
-            value += (state["load"] - 40.0) * 0.2
-        
-        # 退化影响
-        if state["degradation"] > 0:
-            if sensor_type == SENSOR_TYPE_VIBRATION:
-                value *= (1 + state["degradation"] * 2.0)
-            elif sensor_type == SENSOR_TYPE_TEMPERATURE:
-                value += state["degradation"] * 20.0
-            elif sensor_type == SENSOR_TYPE_DISPLACEMENT:
-                value *= (1 + state["degradation"] * 3.0)
-        
-        # 异常模式下的特殊处理
-        if machine_id in self.anomaly_machines:
-            if sensor_type == SENSOR_TYPE_VIBRATION and sensor_idx in [0, 1, 3, 4]:
-                # 前/后轴承振动异常增大
-                anomaly_factor = 3.0 + random.random() * 2.0
-                value *= anomaly_factor
-            if sensor_type == SENSOR_TYPE_TEMPERATURE and sensor_idx in [8, 9]:
-                # 轴承温度异常
-                value += 20.0 + random.random() * 10.0
-        
-        return value
 
-    def build_packet(self, machine_id, timestamp_ms):
-        """构建EtherCAT模拟数据包"""
-        # 包头: 传感器数量(2字节) + 机床ID(2字节) + 时间戳(8字节)
-        packet = struct.pack("<HHq", SENSORS_PER_MACHINE, machine_id, timestamp_ms)
+def generate_packet(machine: MachineState, timestamp: float) -> bytes:
+    packet = bytearray()
+    
+    packet += struct.pack('<H', ECAT_MAGIC)
+    packet += struct.pack('<B', 1)
+    packet += struct.pack('<B', 0)
+    packet += struct.pack('<H', machine.machine_id)
+    packet += struct.pack('<d', machine.spindle_speed)
+    packet += struct.pack('<B', 8)
+    packet += struct.pack('<B', 4)
+    packet += struct.pack('<B', 2)
+    
+    t = timestamp
+    for i, vib in enumerate(machine.vibration_sensors):
+        freq_base = 50 + i * 20
+        x = math.sin(2 * math.pi * freq_base * t) * vib.base_rms * 0.3
+        y = math.sin(2 * math.pi * (freq_base * 1.5) * t) * vib.base_rms * 0.3
+        z = math.sin(2 * math.pi * (freq_base * 0.7) * t) * vib.base_rms * 0.2
         
-        state = self.machine_states[machine_id]
+        x += random.gauss(0, vib.noise_level * 0.1)
+        y += random.gauss(0, vib.noise_level * 0.1)
+        z += random.gauss(0, vib.noise_level * 0.1)
         
-        for sensor_idx in range(SENSORS_PER_MACHINE):
-            value = self.generate_sensor_value(machine_id, sensor_idx, timestamp_ms / 1000.0)
-            sensor_type = SENSOR_CONFIG[sensor_idx][1]
-            
-            # 每个传感器数据: 传感器ID(2字节) + 类型(1字节) + 保留(1字节) + 
-            #              数值(4字节) + 转速(4字节) + 负载(4字节) + 温度(4字节)
-            sensor_id = sensor_idx + 1
-            packet += struct.pack("<HHB B ffff", 
-                                  sensor_id, 0,  # sensor_id, padding
-                                  sensor_type, 0,  # type, padding
-                                  value,
-                                  state["spindle_speed"],
-                                  state["load"],
-                                  45.0)  # 参考温度
+        amplitude = vib.base_rms * vib.fault_factor * (1 + machine.health_degradation)
+        rms = amplitude + random.gauss(0, vib.noise_level * 0.2)
+        peak = rms * (2.5 + random.uniform(0, 1.5))
+        crest_factor = peak / max(rms, 0.01)
         
-        return packet
+        packet += struct.pack('<B', i + 1)
+        packet += struct.pack('<ddd', x, y, z)
+        packet += struct.pack('<ddd', rms, peak, crest_factor)
+    
+    for i, temp in enumerate(machine.temp_sensors):
+        runtime_factor = min(machine.runtime_hours / 10000.0, 1.0)
+        value = temp.base_temp + temp.rising_rate * machine.runtime_hours
+        value += random.gauss(0, temp.noise_level)
+        value += runtime_factor * 5.0
+        
+        packet += struct.pack('<B', i + 1)
+        packet += struct.pack('<d', value)
+    
+    for i in range(2):
+        axial = random.gauss(0.005, 0.002) * (1 + machine.health_degradation * 2)
+        radial = random.gauss(0.01, 0.003) * (1 + machine.health_degradation * 2)
+        
+        packet += struct.pack('<B', i + 1)
+        packet += struct.pack('<dd', axial, radial)
+    
+    return bytes(packet)
 
-    def update_machine_states(self):
-        """更新机床状态（模拟工况变化）"""
-        for machine_id, state in self.machine_states.items():
-            # 转速波动
-            state["spindle_speed"] = max(1000, min(15000, 
-                state["spindle_speed"] + random.gauss(0, 50)))
-            
-            # 负载波动
-            state["load"] = max(10, min(95, 
-                state["load"] + random.gauss(0, 2)))
-            
-            # 缓慢退化（模拟长期磨损）
-            state["degradation"] = min(1.0, 
-                state["degradation"] + random.random() * 0.0001)
-            
-            # 异常机床退化更快
-            if machine_id in self.anomaly_machines:
-                state["degradation"] = min(1.0, 
-                    state["degradation"] + random.random() * 0.001)
 
-    def run(self, duration_minutes=0):
-        """运行模拟器"""
-        print(f"EtherCAT/UDP 模拟器启动")
-        print(f"目标地址: {self.host}:{self.port}")
-        print(f"机床数量: {self.num_machines}")
-        print(f"上报间隔: {INTERVAL_MS}ms")
-        print(f"传感器/机床: {SENSORS_PER_MACHINE}")
-        print(f"数据点数/秒: {self.num_machines * SENSORS_PER_MACHINE * (1000 // INTERVAL_MS)}")
-        
-        if duration_minutes > 0:
-            print(f"运行时长: {duration_minutes} 分钟")
-        
-        start_time = time.time()
-        packet_count = 0
-        
+def machine_worker(machine: MachineState, sock: socket.socket, stop_event: threading.Event):
+    start_time = time.time()
+    
+    while not stop_event.is_set():
         try:
-            while True:
-                # 检查是否超时
-                if duration_minutes > 0:
-                    elapsed = time.time() - start_time
-                    if elapsed >= duration_minutes * 60:
-                        print(f"\n已运行 {duration_minutes} 分钟，停止模拟")
-                        break
-                
-                timestamp_ms = int(time.time() * 1000)
-                
-                # 更新状态
-                self.update_machine_states()
-                
-                # 为每台机床生成并发送数据包
-                for machine_id in range(1, self.num_machines + 1):
-                    packet = self.build_packet(machine_id, timestamp_ms)
-                    self.sock.sendto(packet, (self.host, self.port))
-                    packet_count += 1
-                
-                # 状态输出
-                if packet_count % 1000 == 0:
-                    elapsed = time.time() - start_time
-                    rate = packet_count / elapsed if elapsed > 0 else 0
-                    print(f"\r已发送 {packet_count} 个数据包, 速率: {rate:.1f} 包/秒", end="")
-                
-                # 等待下一个周期
-                next_time = (timestamp_ms + INTERVAL_MS) / 1000.0
-                sleep_time = next_time - time.time()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-        
-        except KeyboardInterrupt:
-            print(f"\n\n用户中断")
-        
-        finally:
-            elapsed = time.time() - start_time
-            print(f"总计发送 {packet_count} 个数据包")
-            print(f"运行时间: {elapsed:.1f} 秒")
-            print(f"平均速率: {packet_count / elapsed:.1f} 包/秒")
-            self.sock.close()
+            current_time = time.time()
+            elapsed = current_time - start_time
+            
+            if machine.is_running:
+                speed_variation = math.sin(elapsed * 0.1) * 200
+                machine.spindle_speed = machine.base_speed + speed_variation
+                machine.runtime_hours += SAMPLE_INTERVAL / 3600
+            
+            if random.random() < 0.0001:
+                machine.health_degradation = min(machine.health_degradation + 0.001, 0.8)
+            
+            packet = generate_packet(machine, elapsed)
+            sock.sendto(packet, (UDP_HOST, UDP_PORT))
+            
+            time.sleep(SAMPLE_INTERVAL)
+        except Exception as e:
+            print(f"机床 {machine.machine_id} 发送失败: {e}")
+            time.sleep(SAMPLE_INTERVAL)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EtherCAT/UDP 数据模拟器")
-    parser.add_argument("--host", default=DEFAULT_UDP_HOST, help="UDP目标主机")
-    parser.add_argument("--port", type=int, default=DEFAULT_UDP_PORT, help="UDP目标端口")
-    parser.add_argument("--machines", type=int, default=NUM_MACHINES, help="模拟机床数量")
-    parser.add_argument("--duration", type=int, default=0, help="运行时长（分钟），0表示无限运行")
-    parser.add_argument("--anomaly", action="store_true", help="启用异常模式，模拟部分机床故障")
+    print("=" * 60)
+    print("EtherCAT/UDP 数据模拟器启动")
+    print(f"目标地址: {UDP_HOST}:{UDP_PORT}")
+    print(f"模拟机床数量: {MACHINE_COUNT}")
+    print(f"采样间隔: {SAMPLE_INTERVAL * 1000}ms")
+    print("=" * 60)
     
-    args = parser.parse_args()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    simulator = EtherCATSimulator(
-        host=args.host,
-        port=args.port,
-        num_machines=args.machines,
-        anomaly_mode=args.anomaly
-    )
+    machines = [create_machine(i) for i in range(1, MACHINE_COUNT + 1)]
     
-    simulator.run(duration_minutes=args.duration)
+    stop_event = threading.Event()
+    threads = []
+    
+    for machine in machines:
+        t = threading.Thread(target=machine_worker, args=(machine, sock, stop_event), daemon=True)
+        t.start()
+        threads.append(t)
+    
+    print(f"{MACHINE_COUNT} 个机床模拟器线程已启动")
+    print("按 Ctrl+C 停止...")
+    print("-" * 60)
+    
+    try:
+        packet_count = 0
+        last_report = time.time()
+        
+        while True:
+            time.sleep(1)
+            packet_count += MACHINE_COUNT * int(1 / SAMPLE_INTERVAL)
+            
+            if time.time() - last_report >= 5:
+                speed = packet_count / 5
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 已发送 {packet_count} 包 (约 {speed:.0f} 包/秒)")
+                print(f"  机床 5 (故障模拟): RMS={machines[4].vibration_sensors[0].base_rms * machines[4].vibration_sensors[0].fault_factor:.2f} mm/s")
+                last_report = time.time()
+                packet_count = 0
+                
+    except KeyboardInterrupt:
+        print("\n正在停止...")
+        stop_event.set()
+        
+        for t in threads:
+            t.join(timeout=2)
+        
+        sock.close()
+        print("模拟器已停止")
 
 
 if __name__ == "__main__":

@@ -1,278 +1,324 @@
--- 精密数控机床主轴健康监控系统数据库初始化脚本
--- ClickHouse 23.x+
+-- 精密数控机床主轴健康监控系统 - ClickHouse 初始化脚本
+-- 创建时间: 2026-06-07
 
-CREATE DATABASE IF NOT EXISTS spindle_monitor ENGINE = Atomic;
+-- 创建数据库
+CREATE DATABASE IF NOT EXISTS spindle_monitor
+ENGINE = Atomic;
 
 USE spindle_monitor;
 
--- 机床信息表
-CREATE TABLE IF NOT EXISTS machine_info (
-    machine_id UInt16,
-    machine_name String,
-    model String,
-    install_date Date,
-    location String,
-    operator String,
-    status Enum8('running' = 1, 'idle' = 2, 'maintenance' = 3, 'fault' = 4) DEFAULT 'running',
-    created_at DateTime DEFAULT now(),
-    updated_at DateTime DEFAULT now()
-) ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY machine_id
-PRIMARY KEY machine_id;
+-- ==================== 原始数据表 ====================
 
--- 传感器配置表
-CREATE TABLE IF NOT EXISTS sensor_config (
-    sensor_id UInt16,
-    machine_id UInt16,
-    sensor_type Enum8('vibration' = 1, 'temperature' = 2, 'displacement' = 3),
-    position_name String,
-    position_x Float32,
-    position_y Float32,
-    position_z Float32,
-    axis Enum8('x' = 1, 'y' = 2, 'z' = 3, 'radial' = 4, 'axial' = 5),
-    sampling_rate UInt32 DEFAULT 10000,
-    range_min Float32,
-    range_max Float32,
-    unit String,
-    install_date Date,
-    status Enum8('active' = 1, 'inactive' = 2, 'fault' = 3) DEFAULT 'active',
-    created_at DateTime DEFAULT now(),
-    updated_at DateTime DEFAULT now()
-) ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (machine_id, sensor_id)
-PRIMARY KEY (machine_id, sensor_id);
-
--- 原始传感器数据表（高频，100ms间隔）
-CREATE TABLE IF NOT EXISTS sensor_raw_data (
-    timestamp DateTime64(3, 'Asia/Shanghai'),
-    machine_id UInt16,
-    sensor_id UInt16,
-    sensor_type Enum8('vibration' = 1, 'temperature' = 2, 'displacement' = 3),
-    value Float32,
-    spindle_speed Float32,
-    load Float32,
-    temperature Float32
-) ENGINE = MergeTree()
+-- 振动传感器时序数据表
+CREATE TABLE IF NOT EXISTS vibration_data
+(
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, LZ4),
+    machine_id UInt16 CODEC(LZ4),
+    sensor_id UInt8 CODEC(LZ4),
+    x_axis Float64 CODEC(Gorilla, LZ4),
+    y_axis Float64 CODEC(Gorilla, LZ4),
+    z_axis Float64 CODEC(Gorilla, LZ4),
+    rms Float64 CODEC(Gorilla, LZ4),
+    peak Float64 CODEC(Gorilla, LZ4),
+    crest_factor Float64 CODEC(Gorilla, LZ4),
+    spindle_speed Float64 CODEC(Gorilla, LZ4)
+)
+ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (machine_id, sensor_id, timestamp)
-TTL timestamp + INTERVAL 30 DAY
+TTL timestamp + INTERVAL 1 YEAR
 SETTINGS index_granularity = 8192;
 
--- 传感器秒级聚合表（用于实时监控）
-CREATE TABLE IF NOT EXISTS sensor_agg_1s (
-    timestamp DateTime64(0, 'Asia/Shanghai'),
+-- 温度传感器时序数据表
+CREATE TABLE IF NOT EXISTS temperature_data
+(
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, LZ4),
+    machine_id UInt16 CODEC(LZ4),
+    sensor_id UInt8 CODEC(LZ4),
+    value Float64 CODEC(Gorilla, LZ4),
+    spindle_speed Float64 CODEC(Gorilla, LZ4)
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (machine_id, sensor_id, timestamp)
+TTL timestamp + INTERVAL 1 YEAR
+SETTINGS index_granularity = 8192;
+
+-- 位移传感器时序数据表
+CREATE TABLE IF NOT EXISTS displacement_data
+(
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, LZ4),
+    machine_id UInt16 CODEC(LZ4),
+    sensor_id UInt8 CODEC(LZ4),
+    axial Float64 CODEC(Gorilla, LZ4),
+    radial Float64 CODEC(Gorilla, LZ4),
+    spindle_speed Float64 CODEC(Gorilla, LZ4)
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (machine_id, sensor_id, timestamp)
+TTL timestamp + INTERVAL 1 YEAR
+SETTINGS index_granularity = 8192;
+
+-- ==================== 聚合表 ====================
+
+-- 振动数据每分钟聚合表
+CREATE TABLE IF NOT EXISTS vibration_1min
+(
+    timestamp DateTime CODEC(DoubleDelta),
     machine_id UInt16,
-    sensor_id UInt16,
-    sensor_type Enum8('vibration' = 1, 'temperature' = 2, 'displacement' = 3),
-    value_min Float32,
-    value_max Float32,
-    value_avg Float32,
-    value_rms Float32,
-    value_std Float32,
-    value_peak Float32,
-    spindle_speed_avg Float32,
-    load_avg Float32,
-    temperature_avg Float32,
+    sensor_id UInt8,
+    avg_rms Float64,
+    max_rms Float64,
+    min_rms Float64,
+    avg_peak Float64,
+    max_peak Float64,
+    avg_crest Float64,
     sample_count UInt32
-) ENGINE = SummingMergeTree()
+)
+ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (machine_id, sensor_id, timestamp)
-TTL timestamp + INTERVAL 90 DAY
+TTL timestamp + INTERVAL 3 YEAR
 SETTINGS index_granularity = 8192;
 
--- 传感器分钟级聚合表（用于趋势分析）
-CREATE TABLE IF NOT EXISTS sensor_agg_1m (
-    timestamp DateTime,
+-- 温度数据每分钟聚合表
+CREATE TABLE IF NOT EXISTS temperature_1min
+(
+    timestamp DateTime CODEC(DoubleDelta),
     machine_id UInt16,
-    sensor_id UInt16,
-    sensor_type Enum8('vibration' = 1, 'temperature' = 2, 'displacement' = 3),
-    value_min Float32,
-    value_max Float32,
-    value_avg Float32,
-    value_rms Float32,
-    value_std Float32,
-    value_peak Float32,
-    value_crest_factor Float32,
-    spindle_speed_avg Float32,
-    load_avg Float32,
-    temperature_avg Float32,
+    sensor_id UInt8,
+    avg_temp Float64,
+    max_temp Float64,
+    min_temp Float64,
     sample_count UInt32
-) ENGINE = SummingMergeTree()
+)
+ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (machine_id, sensor_id, timestamp)
-TTL timestamp + INTERVAL 2 YEAR
+TTL timestamp + INTERVAL 3 YEAR
 SETTINGS index_granularity = 8192;
 
--- 振动频谱数据表
-CREATE TABLE IF NOT EXISTS vibration_spectrum (
-    timestamp DateTime,
+-- 机床状态汇总表
+CREATE TABLE IF NOT EXISTS machine_status
+(
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta),
     machine_id UInt16,
-    sensor_id UInt16,
-    frequency Array(Float32),
-    amplitude Array(Float32),
-    rpm Float32
-) ENGINE = MergeTree()
+    health_score Float64,
+    rul_hours Float64,
+    max_vibration_rms Float64,
+    max_temperature Float64,
+    alarm_status UInt8,
+    avg_spindle_speed Float64
+)
+ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (machine_id, sensor_id, timestamp)
-TTL timestamp + INTERVAL 90 DAY
+ORDER BY (machine_id, timestamp)
+TTL timestamp + INTERVAL 1 YEAR
 SETTINGS index_granularity = 8192;
 
--- RUL预测结果表
-CREATE TABLE IF NOT EXISTS rul_prediction (
-    timestamp DateTime,
+-- ==================== RUL预测结果表 ====================
+CREATE TABLE IF NOT EXISTS rul_predictions
+(
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta),
     machine_id UInt16,
-    bearing_id UInt8,
-    rul_hours Float32,
-    rul_confidence Float32,
-    vibration_rms_trend Float32,
-    temperature_rate Float32,
-    skf_l10_life Float32,
-    lstm_prediction Float32,
-    health_score UInt8,
-    model_version String DEFAULT 'v1.0',
-    created_at DateTime DEFAULT now()
-) ENGINE = ReplacingMergeTree(created_at)
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (machine_id, bearing_id, timestamp)
-PRIMARY KEY (machine_id, bearing_id, timestamp)
-TTL timestamp + INTERVAL 5 YEAR
-SETTINGS index_granularity = 8192;
-
--- 告警记录表
-CREATE TABLE IF NOT EXISTS alarms (
-    alarm_id UUID DEFAULT generateUUIDv4(),
-    timestamp DateTime,
-    machine_id UInt16,
-    sensor_id UInt16,
-    alarm_level Enum8('info' = 0, 'warning' = 1, 'critical' = 2),
-    alarm_type Enum8('vibration_high' = 1, 'temperature_high' = 2, 'displacement_abnormal' = 3, 'rul_low' = 4, 'sensor_fault' = 5),
-    alarm_message String,
-    value Float32,
-    threshold Float32,
-    duration_ms UInt32,
-    acknowledged Bool DEFAULT false,
-    acknowledged_at DateTime,
-    acknowledged_by String,
-    created_at DateTime DEFAULT now()
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (machine_id, alarm_level, timestamp)
-TTL timestamp + INTERVAL 5 YEAR
-SETTINGS index_granularity = 8192;
-
--- 维护工单表
-CREATE TABLE IF NOT EXISTS work_orders (
-    work_order_id UUID DEFAULT generateUUIDv4(),
-    machine_id UInt16,
-    work_order_type Enum8('preventive' = 1, 'corrective' = 2, 'predictive' = 3),
-    priority Enum8('low' = 1, 'medium' = 2, 'high' = 3, 'urgent' = 4),
-    title String,
-    description String,
-    recommended_parts Array(String),
-    estimated_hours Float32,
-    status Enum8('open' = 1, 'in_progress' = 2, 'completed' = 3, 'cancelled' = 4) DEFAULT 'open',
-    assigned_to String,
-    scheduled_date Date,
-    completed_date Date,
-    created_at DateTime DEFAULT now(),
-    updated_at DateTime DEFAULT now()
-) ENGINE = ReplacingMergeTree(updated_at)
-PARTITION BY toYYYYMM(created_at)
-ORDER BY (machine_id, status, created_at)
-PRIMARY KEY work_order_id
-TTL created_at + INTERVAL 10 YEAR
-SETTINGS index_granularity = 8192;
-
--- 换刀建议表
-CREATE TABLE IF NOT EXISTS tool_change_suggestions (
-    suggestion_id UUID DEFAULT generateUUIDv4(),
-    machine_id UInt16,
-    tool_id UInt16,
-    reason String,
-    rul_hours Float32,
-    recommended_action String,
-    created_at DateTime DEFAULT now()
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(created_at)
-ORDER BY (machine_id, created_at)
-TTL created_at + INTERVAL 1 YEAR
-SETTINGS index_granularity = 8192;
-
--- 健康评分历史表
-CREATE TABLE IF NOT EXISTS health_score_history (
-    timestamp DateTime,
-    machine_id UInt16,
-    overall_score UInt8,
-    vibration_score UInt8,
-    temperature_score UInt8,
-    displacement_score UInt8,
-    rul_score UInt8,
-    created_at DateTime DEFAULT now()
-) ENGINE = MergeTree()
+    rul_hours Float64,
+    confidence Float64,
+    avg_rms Float64,
+    temp_rate Float64,
+    bearing_life_hours Float64,
+    model_version String DEFAULT 'v1.0'
+)
+ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (machine_id, timestamp)
 TTL timestamp + INTERVAL 5 YEAR
 SETTINGS index_granularity = 8192;
 
--- 初始化机床数据（40台五轴数控机床）
-INSERT INTO machine_info (machine_id, machine_name, model, install_date, location, operator, status)
+-- ==================== 告警事件表 ====================
+CREATE TABLE IF NOT EXISTS alarm_events
+(
+    id String,
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta),
+    machine_id UInt16,
+    sensor_type String,
+    sensor_id Nullable(UInt8),
+    level UInt8,
+    message String,
+    value Float64,
+    threshold Float64,
+    acknowledged UInt8 DEFAULT 0,
+    acknowledged_at Nullable(DateTime64(3, 'UTC')),
+    acknowledged_by Nullable(String)
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (timestamp, machine_id, level)
+TTL timestamp + INTERVAL 5 YEAR
+SETTINGS index_granularity = 8192;
+
+-- ==================== 维护工单表 ====================
+CREATE TABLE IF NOT EXISTS work_orders
+(
+    id String,
+    machine_id UInt16,
+    created_at DateTime64(3, 'UTC'),
+    rul_hours Float64,
+    priority String,
+    description String,
+    status String DEFAULT 'PENDING',
+    completed_at Nullable(DateTime64(3, 'UTC')),
+    technician Nullable(String)
+)
+ENGINE = MergeTree()
+ORDER BY (created_at, machine_id, status)
+TTL created_at + INTERVAL 10 YEAR
+SETTINGS index_granularity = 8192;
+
+-- ==================== 物化视图 ====================
+
+-- 振动1分钟聚合视图
+CREATE MATERIALIZED VIEW IF NOT EXISTS vibration_1min_mv
+TO vibration_1min
+AS
+SELECT
+    toStartOfMinute(timestamp) AS timestamp,
+    machine_id,
+    sensor_id,
+    avg(rms) AS avg_rms,
+    max(rms) AS max_rms,
+    min(rms) AS min_rms,
+    avg(peak) AS avg_peak,
+    max(peak) AS max_peak,
+    avg(crest_factor) AS avg_crest,
+    count() AS sample_count
+FROM vibration_data
+GROUP BY timestamp, machine_id, sensor_id;
+
+-- 温度1分钟聚合视图
+CREATE MATERIALIZED VIEW IF NOT EXISTS temperature_1min_mv
+TO temperature_1min
+AS
+SELECT
+    toStartOfMinute(timestamp) AS timestamp,
+    machine_id,
+    sensor_id,
+    avg(value) AS avg_temp,
+    max(value) AS max_temp,
+    min(value) AS min_temp,
+    count() AS sample_count
+FROM temperature_data
+GROUP BY timestamp, machine_id, sensor_id;
+
+-- ==================== 机床信息维度表 ====================
+CREATE TABLE IF NOT EXISTS machines
+(
+    machine_id UInt16,
+    machine_name String,
+    model String,
+    location String,
+    install_date Date,
+    bearing_model String,
+    rated_speed Float64,
+    rated_power Float64
+)
+ENGINE = ReplacingMergeTree()
+ORDER BY machine_id
+SETTINGS index_granularity = 8192;
+
+-- 插入40台机床的基础数据
+INSERT INTO machines (machine_id, machine_name, model, location, install_date, bearing_model, rated_speed, rated_power)
 SELECT
     number AS machine_id,
     concat('CNC-', toString(number)) AS machine_name,
     'DMG MORI DMU 50' AS model,
-    toDate('2022-01-01') + (number % 365) AS install_date,
-    concat('Line-', toString(intDiv(number, 10) + 1)) AS location,
-    concat('Operator-', toString(number % 10 + 1)) AS operator,
-    if(number % 7 = 0, 'idle', 'running') AS status
+    concat('车间A-', toString(floor(number / 10) + 1)) AS location,
+    toDate('2022-01-01') + (number * 7) AS install_date,
+    'SKF 7014ACDGA/P4A' AS bearing_model,
+    18000.0 AS rated_speed,
+    22.0 AS rated_power
 FROM numbers(1, 40);
 
--- 初始化传感器配置
--- 每台机床: 8个振动传感器, 4个温度传感器, 2个位移传感器
-INSERT INTO sensor_config (sensor_id, machine_id, sensor_type, position_name, position_x, position_y, position_z, axis, range_min, range_max, unit, install_date)
-SELECT
-    row_number() OVER (PARTITION BY m.machine_id ORDER BY s.sensor_type, s.idx) AS sensor_id,
-    m.machine_id,
-    s.sensor_type,
-    s.position_name,
-    s.position_x,
-    s.position_y,
-    s.position_z,
-    s.axis,
-    s.range_min,
-    s.range_max,
-    s.unit,
-    toDate('2022-01-01')
-FROM machine_info m
-CROSS JOIN (
-    -- 8个振动传感器
-    SELECT 1 AS idx, 'vibration' AS sensor_type, '前轴承径向X' AS position_name, -20.0 AS position_x, 0.0 AS position_y, 100.0 AS position_z, 'x' AS axis, -50.0 AS range_min, 50.0 AS range_max, 'mm/s' AS unit
-    UNION ALL SELECT 2, 'vibration', '前轴承径向Y', 0.0, -20.0, 100.0, 'y', -50.0, 50.0, 'mm/s'
-    UNION ALL SELECT 3, 'vibration', '前轴承轴向', 0.0, 0.0, 120.0, 'z', -50.0, 50.0, 'mm/s'
-    UNION ALL SELECT 4, 'vibration', '后轴承径向X', -20.0, 0.0, -100.0, 'x', -50.0, 50.0, 'mm/s'
-    UNION ALL SELECT 5, 'vibration', '后轴承径向Y', 0.0, -20.0, -100.0, 'y', -50.0, 50.0, 'mm/s'
-    UNION ALL SELECT 6, 'vibration', '后轴承轴向', 0.0, 0.0, -120.0, 'z', -50.0, 50.0, 'mm/s'
-    UNION ALL SELECT 7, 'vibration', '电机端径向', -15.0, 0.0, 150.0, 'radial', -50.0, 50.0, 'mm/s'
-    UNION ALL SELECT 8, 'vibration', '刀具端径向', -15.0, 0.0, -150.0, 'radial', -50.0, 50.0, 'mm/s'
-    UNION ALL
-    -- 4个温度传感器
-    SELECT 9, 'temperature', '前轴承座', 0.0, 0.0, 100.0, 'axial', -40.0, 150.0, '°C'
-    UNION ALL SELECT 10, 'temperature', '后轴承座', 0.0, 0.0, -100.0, 'axial', -40.0, 150.0, '°C'
-    UNION ALL SELECT 11, 'temperature', '定子绕组', 0.0, 0.0, 50.0, 'axial', -40.0, 180.0, '°C'
-    UNION ALL SELECT 12, 'temperature', '环境温度', 50.0, 0.0, 0.0, 'axial', -40.0, 80.0, '°C'
-    UNION ALL
-    -- 2个位移传感器
-    SELECT 13, 'displacement', '轴向位移', 0.0, 0.0, 0.0, 'axial', -2.0, 2.0, 'mm'
-    UNION ALL SELECT 14, 'displacement', '径向跳动', 0.0, 0.0, 0.0, 'radial', 0.0, 0.5, 'mm'
-) s;
+-- ==================== 传感器位置配置表 ====================
+CREATE TABLE IF NOT EXISTS sensor_positions
+(
+    sensor_type String,
+    sensor_id UInt8,
+    name String,
+    x Float64,
+    y Float64,
+    location String
+)
+ENGINE = ReplacingMergeTree()
+ORDER BY (sensor_type, sensor_id);
 
--- 初始化健康评分数据
-INSERT INTO health_score_history (timestamp, machine_id, overall_score, vibration_score, temperature_score, displacement_score, rul_score)
+-- 插入8个振动传感器位置
+INSERT INTO sensor_positions (sensor_type, sensor_id, name, x, y, location) VALUES
+('vibration', 1, '前轴承径向X', 120, 80, '前端轴承座'),
+('vibration', 2, '前轴承径向Y', 120, 120, '前端轴承座'),
+('vibration', 3, '前轴承轴向', 80, 100, '前端轴承座'),
+('vibration', 4, '中轴承径向X', 250, 80, '中间支撑'),
+('vibration', 5, '中轴承径向Y', 250, 120, '中间支撑'),
+('vibration', 6, '后轴承径向X', 380, 80, '后端轴承座'),
+('vibration', 7, '后轴承径向Y', 380, 120, '后端轴承座'),
+('vibration', 8, '刀柄位置', 40, 100, '刀具接口');
+
+-- 插入4个温度传感器位置
+INSERT INTO sensor_positions (sensor_type, sensor_id, name, x, y, location) VALUES
+('temperature', 1, '前轴承温度', 130, 70, '前端轴承座'),
+('temperature', 2, '中轴承温度', 260, 70, '中间支撑'),
+('temperature', 3, '后轴承温度', 390, 70, '后端轴承座'),
+('temperature', 4, '定子绕组温度', 300, 130, '电机定子');
+
+-- 插入2个位移传感器位置
+INSERT INTO sensor_positions (sensor_type, sensor_id, name, x, y, location) VALUES
+('displacement', 1, '主轴轴向位移', 50, 100, '前端'),
+('displacement', 2, '主轴径向跳动', 100, 110, '前端轴承座');
+
+-- ==================== 索引优化 ====================
+ALTER TABLE vibration_data ADD INDEX IF NOT EXISTS idx_rms rms TYPE minmax GRANULARITY 4;
+ALTER TABLE temperature_data ADD INDEX IF NOT EXISTS idx_temp value TYPE minmax GRANULARITY 4;
+ALTER TABLE alarm_events ADD INDEX IF NOT EXISTS idx_level level TYPE set(4) GRANULARITY 4;
+
+-- ==================== 查询示例视图 ====================
+-- 获取当前所有机床状态的最新视图
+CREATE VIEW IF NOT EXISTS latest_machine_status AS
 SELECT
-    now() - INTERVAL 1 HOUR,
-    machine_id,
-    80 + (machine_id % 20) AS overall_score,
-    75 + (machine_id % 25) AS vibration_score,
-    85 + (machine_id % 15) AS temperature_score,
-    90 + (machine_id % 10) AS displacement_score,
-    70 + (machine_id % 30) AS rul_score
-FROM machine_info;
+    m.machine_id,
+    m.machine_name,
+    m.model,
+    m.location,
+    ms.health_score,
+    ms.rul_hours,
+    ms.max_vibration_rms,
+    ms.max_temperature,
+    ms.alarm_status,
+    ms.timestamp AS last_update
+FROM machines m
+LEFT JOIN (
+    SELECT
+        machine_id,
+        argMax(health_score, timestamp) AS health_score,
+        argMax(rul_hours, timestamp) AS rul_hours,
+        argMax(max_vibration_rms, timestamp) AS max_vibration_rms,
+        argMax(max_temperature, timestamp) AS max_temperature,
+        argMax(alarm_status, timestamp) AS alarm_status,
+        max(timestamp) AS timestamp
+    FROM machine_status
+    WHERE timestamp > now() - INTERVAL 5 MINUTE
+    GROUP BY machine_id
+) ms ON m.machine_id = ms.machine_id
+ORDER BY m.machine_id;
+
+-- 本月告警统计视图
+CREATE VIEW IF NOT EXISTS monthly_alarm_stats AS
+SELECT
+    toYYYYMM(timestamp) AS month,
+    count() AS total_alarms,
+    countIf(level = 2) AS critical_alarms,
+    countIf(level = 1) AS warning_alarms,
+    countDistinct(machine_id) AS affected_machines
+FROM alarm_events
+WHERE timestamp >= toStartOfMonth(now())
+GROUP BY month
+ORDER BY month DESC;

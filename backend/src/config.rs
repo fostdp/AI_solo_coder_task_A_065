@@ -1,70 +1,51 @@
+use serde::Deserialize;
 use std::env;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub udp_port: u16,
-    pub http_port: u16,
+    pub api_port: u16,
     pub clickhouse_url: String,
     pub clickhouse_user: String,
     pub clickhouse_password: String,
     pub clickhouse_database: String,
     pub mqtt_broker: String,
     pub mqtt_port: u16,
-    pub mqtt_topic: String,
-    pub vibration_warning_threshold: f32,
-    pub vibration_critical_threshold: f32,
-    pub rul_warning_threshold: f32,
-    pub rul_critical_threshold: f32,
-    pub vibration_alarm_duration_ms: u64,
+    pub mqtt_topic_alarm: String,
+    pub mqtt_topic_mes: String,
+    pub vibration_warning_threshold: f64,
+    pub vibration_alarm_threshold: f64,
+    pub rul_warning_hours: f64,
+    pub rul_alarm_hours: f64,
+    pub alarm_duration_seconds: u64,
+    pub machine_count: usize,
+    pub vibration_sensors_per_machine: usize,
+    pub temperature_sensors_per_machine: usize,
+    pub displacement_sensors_per_machine: usize,
 }
 
-impl Config {
-    pub fn from_env() -> Self {
-        Config {
-            udp_port: env::var("UDP_PORT")
-                .unwrap_or_else(|_| "9999".to_string())
-                .parse()
-                .expect("Invalid UDP_PORT"),
-            http_port: env::var("HTTP_PORT")
-                .unwrap_or_else(|_| "8080".to_string())
-                .parse()
-                .expect("Invalid HTTP_PORT"),
-            clickhouse_url: env::var("CLICKHOUSE_URL")
-                .unwrap_or_else(|_| "http://localhost:8123".to_string()),
-            clickhouse_user: env::var("CLICKHOUSE_USER")
-                .unwrap_or_else(|_| "default".to_string()),
-            clickhouse_password: env::var("CLICKHOUSE_PASSWORD")
-                .unwrap_or_else(|_| "".to_string()),
-            clickhouse_database: env::var("CLICKHOUSE_DATABASE")
-                .unwrap_or_else(|_| "spindle_monitor".to_string()),
-            mqtt_broker: env::var("MQTT_BROKER")
-                .unwrap_or_else(|_| "localhost".to_string()),
-            mqtt_port: env::var("MQTT_PORT")
-                .unwrap_or_else(|_| "1883".to_string())
-                .parse()
-                .expect("Invalid MQTT_PORT"),
-            mqtt_topic: env::var("MQTT_TOPIC")
-                .unwrap_or_else(|_| "spindle/alarm".to_string()),
-            vibration_warning_threshold: env::var("VIBRATION_WARNING_THRESHOLD")
-                .unwrap_or_else(|_| "2.8".to_string())
-                .parse()
-                .expect("Invalid VIBRATION_WARNING_THRESHOLD"),
-            vibration_critical_threshold: env::var("VIBRATION_CRITICAL_THRESHOLD")
-                .unwrap_or_else(|_| "7.1".to_string())
-                .parse()
-                .expect("Invalid VIBRATION_CRITICAL_THRESHOLD"),
-            rul_warning_threshold: env::var("RUL_WARNING_THRESHOLD")
-                .unwrap_or_else(|_| "500.0".to_string())
-                .parse()
-                .expect("Invalid RUL_WARNING_THRESHOLD"),
-            rul_critical_threshold: env::var("RUL_CRITICAL_THRESHOLD")
-                .unwrap_or_else(|_| "200.0".to_string())
-                .parse()
-                .expect("Invalid RUL_CRITICAL_THRESHOLD"),
-            vibration_alarm_duration_ms: env::var("VIBRATION_ALARM_DURATION_MS")
-                .unwrap_or_else(|_| "10000".to_string())
-                .parse()
-                .expect("Invalid VIBRATION_ALARM_DURATION_MS"),
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            udp_port: env::var("UDP_PORT").unwrap_or_else(|_| "9876".to_string()).parse().unwrap_or(9876),
+            api_port: env::var("API_PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080),
+            clickhouse_url: env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string()),
+            clickhouse_user: env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string()),
+            clickhouse_password: env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "".to_string()),
+            clickhouse_database: env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "spindle_monitor".to_string()),
+            mqtt_broker: env::var("MQTT_BROKER").unwrap_or_else(|_| "localhost".to_string()),
+            mqtt_port: env::var("MQTT_PORT").unwrap_or_else(|_| "1883".to_string()).parse().unwrap_or(1883),
+            mqtt_topic_alarm: env::var("MQTT_TOPIC_ALARM").unwrap_or_else(|_| "workshop/alarm".to_string()),
+            mqtt_topic_mes: env::var("MQTT_TOPIC_MES").unwrap_or_else(|_| "mes/spindle".to_string()),
+            vibration_warning_threshold: 2.8,
+            vibration_alarm_threshold: 7.1,
+            rul_warning_hours: 500.0,
+            rul_alarm_hours: 200.0,
+            alarm_duration_seconds: 10,
+            machine_count: 40,
+            vibration_sensors_per_machine: 8,
+            temperature_sensors_per_machine: 4,
+            displacement_sensors_per_machine: 2,
         }
     }
 }
