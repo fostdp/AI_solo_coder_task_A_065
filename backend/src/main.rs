@@ -8,6 +8,7 @@ mod alarm_manager;
 mod mqtt_client;
 mod api_server;
 mod websocket_server;
+mod iso22400_adapter;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

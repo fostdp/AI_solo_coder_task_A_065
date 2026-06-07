@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{RwLock, mpsc};
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
-use tracing::{info, error, debug};
+use tracing::{info, error, warn, debug};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::config::Config;
@@ -10,6 +11,32 @@ use crate::clickhouse_client::ClickHouseClient;
 use crate::signal_processing::SignalProcessor;
 use crate::alarm_manager::AlarmManager;
 
+const MAX_UDP_SIZE: usize = 65536;
+const DISPATCH_CHANNEL_CAPACITY: usize = 1024;
+const PROCESS_BATCH_SIZE: usize = 32;
+
+struct MachineDispatcher {
+    senders: std::collections::HashMap<u16, mpsc::Sender<SensorData>>,
+}
+
+impl MachineDispatcher {
+    fn new() -> Self {
+        Self {
+            senders: std::collections::HashMap::new(),
+        }
+    }
+
+    fn get_or_create_sender(&mut self, machine_id: u16) -> mpsc::Sender<SensorData> {
+        self.senders
+            .entry(machine_id)
+            .or_insert_with(|| {
+                let (tx, _) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
+                tx
+            })
+            .clone()
+    }
+}
+
 pub async fn start_udp_server(
     config: Config,
     app_state: Arc<RwLock<AppState>>,
@@ -17,34 +44,125 @@ pub async fn start_udp_server(
     signal_processor: Arc<SignalProcessor>,
     alarm_manager: Arc<AlarmManager>,
 ) -> anyhow::Result<()> {
-    let addr = format!("0.0.0.0:{}", config.server.udp_port);
-    let socket = UdpSocket::bind(&addr).await?;
-    info!("UDP server listening on {}", addr);
+    let socket = Arc::new(UdpSocket::bind(format!("0.0.0.0:{}", config.server.udp_port)).await?);
+    
+    socket.set_recv_buffer_size(8 * 1024 * 1024)?;
+    info!(
+        "UDP server listening on 0.0.0.0:{}, recv_buffer=8MB, machines={}",
+        config.server.udp_port, config.machines.count
+    );
 
-    let mut buf = vec![0u8; 65536];
+    let dispatcher = Arc::new(RwLock::new(MachineDispatcher::new()));
+    let mut packet_count_total = 0u64;
+    let mut packet_drop_total = 0u64;
 
+    for machine_id in 1..=config.machines.count {
+        let app_state_clone = app_state.clone();
+        let clickhouse_clone = clickhouse.clone();
+        let signal_processor_clone = signal_processor.clone();
+        let alarm_manager_clone = alarm_manager.clone();
+        let config_clone = config.clone();
+        let dispatcher_clone = dispatcher.clone();
+
+        let (tx, mut rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
+        
+        {
+            let mut disp = dispatcher_clone.write().await;
+            disp.senders.insert(machine_id, tx);
+        }
+
+        tokio::spawn(async move {
+            let mut batch = Vec::with_capacity(PROCESS_BATCH_SIZE);
+            let mut last_flush = tokio::time::interval(Duration::from_millis(10));
+            
+            loop {
+                tokio::select! {
+                    Some(data) = rx.recv() => {
+                        batch.push(data);
+                        if batch.len() >= PROCESS_BATCH_SIZE {
+                            process_batch(&mut batch, &app_state_clone, &clickhouse_clone, 
+                                       &signal_processor_clone, &alarm_manager_clone, &config_clone).await;
+                        batch.clear();
+                    }
+                    _ = last_flush.tick() => {
+                            if !batch.is_empty() {
+                                process_batch(&mut batch, &app_state_clone, &clickhouse_clone, 
+                                           &signal_processor_clone, &alarm_manager_clone, &config_clone).await;
+                            batch.clear();
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let stats_socket = socket.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            info!(
+                "UDP stats: total_packets={}, drop_total={}, rate={:.1}/s",
+                packet_count_total, packet_drop_total,
+                packet_count_total as f64 / 10.0
+            );
+            packet_count_total = 0;
+        }
+    });
+
+    let mut buf = vec![0u8; MAX_UDP_SIZE];
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, _src)) => {
-                if let Ok(sensor_data) = parse_udp_packet(&buf[..len]) {
-                    debug!("Received data from machine {}", sensor_data.machine_id);
-                    
-                    let processed = signal_processor.process_metrics(&sensor_data);
-                    
-                    clickhouse.insert_metrics(&processed).await.unwrap_or_else(|e| {
-                        error!("Failed to insert metrics: {}", e);
-                    });
-
-                    alarm_manager.check_vibration_alarm(&processed).await;
-
-                    let mut state = app_state.write().await;
-                    update_app_state(&mut state, &processed, &config);
+                packet_count_total += 1;
+                match parse_udp_packet(&buf[..len]) {
+                    Ok(sensor_data) => {
+                        let machine_id = sensor_data.machine_id;
+                        
+                        let disp = dispatcher.read().await;
+                        if let Some(sender) = disp.senders.get(&machine_id) {
+                            if let Err(e) = sender.try_send(sensor_data) {
+                                packet_drop_total += 1;
+                                warn!("Machine {} channel full, dropping packet: {}", machine_id, e);
+                            }
+                        } else {
+                            debug!("Received data from unknown machine: {}", machine_id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse UDP packet: {}", e);
+                    }
                 }
             }
             Err(e) => {
-                error!("UDP receive error: {}", e);
+                error!("UDP recv error: {}", e);
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
+    }
+}
+
+async fn process_batch(
+    batch: &mut Vec<SensorData>,
+    app_state: &Arc<RwLock<AppState>>,
+    clickhouse: &Arc<ClickHouseClient>,
+    signal_processor: &Arc<SignalProcessor>,
+    alarm_manager: &Arc<AlarmManager>,
+    config: &Config,
+) {
+    let mut processed_metrics = Vec::with_capacity(batch.len());
+    
+    for sensor_data in batch.drain(..) {
+        let processed = signal_processor.process_metrics(&sensor_data);
+        
+        if let Err(e) = clickhouse.insert_metrics(&processed).await {
+            error!("Failed to insert metrics: {}", e);
+        }
+
+        alarm_manager.check_vibration_alarm(&processed).await;
+
+        let mut state = app_state.write().await;
+        update_app_state(&mut state, &processed, config);
     }
 }
 

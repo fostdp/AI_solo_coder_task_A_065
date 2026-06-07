@@ -2,6 +2,72 @@ use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperatingCondition {
+    LowSpeed,
+    MediumSpeed,
+    HighSpeed,
+    Unknown,
+}
+
+impl OperatingCondition {
+    pub fn from_rpm(rpm: f64) -> Self {
+        match rpm {
+            r if r < 2000.0 => OperatingCondition::LowSpeed,
+            r if r < 4000.0 => OperatingCondition::MediumSpeed,
+            r if r >= 4000.0 => OperatingCondition::HighSpeed,
+            _ => OperatingCondition::Unknown,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            OperatingCondition::LowSpeed => "low_speed",
+            OperatingCondition::MediumSpeed => "medium_speed",
+            OperatingCondition::HighSpeed => "high_speed",
+            OperatingCondition::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizationParams {
+    pub mean: f64,
+    pub std: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl NormalizationParams {
+    pub fn new(mean: f64, std: f64, min: f64, max: f64) -> Self {
+        Self { mean, std, min, max }
+    }
+
+    pub fn normalize_z_score(&self, value: f64) -> f64 {
+        if self.std == 0.0 { 0.0 } else { (value - self.mean) / self.std }
+    }
+
+    pub fn normalize_minmax(&self, value: f64) -> f64 {
+        let range = self.max - self.min;
+        if range == 0.0 { 0.5 } else { (value - self.min) / range }
+    }
+
+    pub fn denormalize_z_score(&self, normalized: f64) -> f64 {
+        normalized * self.std + self.mean
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionFeatures {
+    pub condition: OperatingCondition,
+    pub rpm_normalized: f64,
+    pub load_estimate: f64,
+    pub vibration_mean: f64,
+    pub vibration_std: f64,
+    pub temp_mean: f64,
+    pub temp_rate: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorData {
     pub timestamp: i64,
