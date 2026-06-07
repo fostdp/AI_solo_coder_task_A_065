@@ -1,0 +1,3 @@
+# EtherCAT Simulator Dependencies
+# Standard library only - no external dependencies required
+# socket, struct, time, random, math, os, json, threading - all built-in

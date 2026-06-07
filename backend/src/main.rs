@@ -9,6 +9,7 @@ mod mqtt_client;
 mod api_server;
 mod websocket_server;
 mod iso22400_adapter;
+mod metrics;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -138,8 +139,15 @@ async fn main() -> anyhow::Result<()> {
         app_state.clone(),
     ));
 
+    let metrics_handle = tokio::spawn(async move {
+        if let Err(e) = metrics::start_metrics_server(9090).await {
+            error!("Metrics server error: {}", e);
+        }
+    });
+
     info!("All modules connected and running!");
     info!("Pipeline: UDP → EtherCAT Driver → Vibration Analyzer → RUL Predictor → Alarm Dispatcher → MQTT/MES");
+    info!("Metrics endpoint: http://0.0.0.0:9090/metrics");
 
     tokio::select! {
         result = ethercat_handle => {
@@ -180,6 +188,11 @@ async fn main() -> anyhow::Result<()> {
         result = ws_handle => {
             if let Err(e) = result {
                 error!("WebSocket server task error: {}", e);
+            }
+        }
+        result = metrics_handle => {
+            if let Err(e) = result {
+                error!("Metrics server task error: {}", e);
             }
         }
     }

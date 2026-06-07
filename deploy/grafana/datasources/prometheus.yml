@@ -1,0 +1,26 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 15s
+      queryTimeout: 30s
+
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    url: http://clickhouse:8123
+    isDefault: false
+    editable: true
+    jsonData:
+      defaultDatabase: cnc_monitor
+      defaultTable: sensor_raw
+      tlsSkipVerify: true
+    secureJsonData:
+      username: default
+      password: ""
